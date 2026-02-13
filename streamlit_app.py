@@ -1,220 +1,191 @@
 import streamlit as st
 import pandas as pd
-import json
+import requests
+import time
 from nba_api.live.nba.endpoints import scoreboard, boxscore
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="Savant NBA Live",
-    page_icon="🏀",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- CONFIGURATION ---
+# ⚠️ SECURITY WARNING: You are hardcoding this key in a public file. 
+# If someone finds your GitHub, they can use your quota.
+API_KEY = "6b10d20e4323876f867026893e161475"
+PREFERRED_BOOK = "fanduel"  # Prioritize FanDuel
 
-st.title("🏀 Savant NBA Live Dashboard")
-st.markdown("### *Live Pace & Referee Arb Engine*")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Savant NBA (FanDuel)", page_icon="🏀", layout="wide")
+st.title("🏀 Savant NBA: Auto-Pilot (FanDuel Mode)")
 
-# --- SIDEBAR: SETTINGS & UPLOAD ---
+# --- SIDEBAR: SETTINGS ---
 with st.sidebar:
-    st.header("1. Upload Odds")
-    uploaded_file = st.file_uploader("Upload Odds File", accept_multiple_files=False)
-
+    st.header("⚙️ Savant Strategy")
+    min_edge = st.slider("Min Edge to Bet", 1.0, 10.0, 4.0, help="Only show bets where Savant > FanDuel by this amount")
     
     st.divider()
     
-    st.header("2. Savant Settings")
-    min_edge = st.slider("Minimum Edge to Bet", 1.0, 15.0, 5.0, help="Only show games where Savant Projection > Book Line by this amount.")
-    foul_threshold = st.number_input("Referee Foul Threshold (FPM)", value=2.0, step=0.1, help="If Fouls Per Minute > this number, the Ref Mode is 'TIGHT'.")
-    
-    st.divider()
-    
-    if st.button("🔄 Refresh Live Data", type="primary"):
+    if st.button("🚀 SCAN FANDUEL LIVE", type="primary"):
         st.rerun()
+    
+    st.caption(f"Using API Key: ...{API_KEY[-4:]}")
 
-# --- HELPER: PARSE ODDS JSON ---
-def load_odds(upload):
-    """
-    Parses the uploaded JSON.
-    Expected Format: [{"Team": "LAL", "Total": 225.5}, ...]
-    """
-    if upload is not None:
-        try:
-            data = json.load(upload)
-            # Create a dictionary for quick lookup: {"LAL": 225.5, "BOS": 218.0}
-            odds_dict = {}
-            for row in data:
-                # Flexible parsing: try uppercase and standard keys
-                team = row.get('Team', row.get('team', 'UNK'))
-                total = row.get('Total', row.get('total', 0))
-                odds_dict[team] = float(total)
-            return odds_dict
-        except Exception as e:
-            st.error(f"Error reading JSON: {e}")
+# --- FUNCTION 1: FETCH ODDS (FANDUEL PRIORITY) ---
+def fetch_live_odds():
+    # URL for NBA Odds (US/Canada Region)
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey={API_KEY}&regions=us&markets=totals&oddsFormat=american"
+    
+    try:
+        response = requests.get(url)
+        data = response.json()
+        
+        if 'message' in data:
+            st.error(f"Odds API Error: {data['message']}")
             return {}
-    return {}
 
-# --- CORE ENGINE: FETCH LIVE DATA ---
-def get_live_savant_data(odds_map):
+        odds_map = {}
+        for game in data:
+            home_team = game['home_team']
+            away_team = game['away_team']
+            
+            # 1. Look for PREFERRED_BOOK (FanDuel)
+            target_book = None
+            for book in game['bookmakers']:
+                if book['key'] == PREFERRED_BOOK:
+                    target_book = book
+                    break
+            
+            # 2. Fallback if FanDuel is missing
+            if not target_book and game['bookmakers']:
+                target_book = game['bookmakers'][0] # Take whatever is available
+                
+            if target_book:
+                # Extract Over/Under Line
+                for market in target_book['markets']:
+                    if market['key'] == 'totals':
+                        line = market['outcomes'][0]['point']
+                        # Map to both team names for lookup
+                        odds_map[home_team] = line
+                        odds_map[away_team] = line
+                        
+        return odds_map
+
+    except Exception as e:
+        st.error(f"Failed to fetch odds: {e}")
+        return {}
+
+# --- FUNCTION 2: FETCH SAVANT LIVE DATA ---
+def get_savant_data(odds_map):
     try:
         board = scoreboard.ScoreBoard()
         games = board.games.get_dict()
-    except Exception as e:
-        st.error(f"NBA API Error: {e}")
+    except:
+        st.warning("Could not connect to NBA API. Are games live?")
         return pd.DataFrame()
 
     live_payload = []
 
     for game in games:
-        # Filter: Only include active games (Status 2)
-        if game['gameStatus'] != 2: 
-            continue
-            
-        game_id = game['gameId']
+        if game['gameStatus'] != 2: continue # Only Live Games
         
+        game_id = game['gameId']
         try:
-            # Pull Live Boxscore
-            box = boxscore.BoxScore(game_id=game_id)
-            stats = box.game.get_dict()
+            stats = boxscore.BoxScore(game_id=game_id).game.get_dict()
         except:
             continue
 
-        # Extract Teams
         home = stats['homeTeam']
         away = stats['awayTeam']
-        h_code = home['teamTricode']
-        a_code = away['teamTricode']
-
-        # --- TIME CALCULATIONS ---
+        
+        # Time Logic
         try:
-            # Game clock format is "PT08M22.00S"
-            clock_str = game['gameClock']
-            minutes_left = int(clock_str.replace('PT','').split('M')[0])
-            minutes_played = ((game['period'] - 1) * 12) + (12 - minutes_left)
+            clock = game['gameClock'].replace('PT','').split('M')[0]
+            min_left = int(clock) if clock.isdigit() else 12
+            min_played = ((game['period'] - 1) * 12) + (12 - min_left)
         except:
-            minutes_played = 1 # Fallback safety
+            min_played = 1
             
-        if minutes_played < 5: 
-            continue # Skip games with <5 mins of sample size
+        if min_played < 5: continue
 
-        # --- SAVANT METRIC 1: LIVE PACE ---
-        # Formula: FGA - ORB + TOV + (0.44 * FTA)
-        def calc_poss(t):
+        # --- METRICS ---
+        def get_poss(t):
             return (t['statistics']['fieldGoalsAttempted'] - 
                     t['statistics']['reboundsOffensive'] + 
                     t['statistics']['turnovers'] + 
-                    (0.44 * t['statistics']['freeThrowsAttempted']))
+                    0.44 * t['statistics']['freeThrowsAttempted'])
 
-        total_poss = calc_poss(home) + calc_poss(away)
-        live_pace = (total_poss / minutes_played) * 48
+        poss = get_poss(home) + get_poss(away)
+        pace = (poss / min_played) * 48
         
-        # --- SAVANT METRIC 2: REFEREE FACTOR ---
-        # High fouls = Stopped Clock = Higher Efficiency
-        total_fouls = home['statistics']['foulsPersonal'] + away['statistics']['foulsPersonal']
-        fpm = total_fouls / minutes_played # Fouls Per Minute
+        fouls = home['statistics']['foulsPersonal'] + away['statistics']['foulsPersonal']
+        fpm = fouls / min_played
         
-        # --- SAVANT PROJECTION ---
-        current_score = home['score'] + away['score']
-        pts_per_poss = current_score / total_poss if total_poss > 0 else 0
+        curr_score = home['score'] + away['score']
         
-        # Referee Adjustment Logic
-        # If Fouls > Threshold, we add a "Ref Boost" (Free Throws are efficient points)
-        ref_adj = 4.5 if fpm > foul_threshold else 0
+        # Referee Adjustment (Tight whistle = Free throws = Efficiency)
+        ref_boost = 4.0 if fpm > 2.1 else 0
         
-        final_proj = (live_pace * pts_per_poss) + ref_adj
+        savant_proj = (pace * (curr_score / poss)) + ref_boost
 
-        # --- ODDS MATCHING ---
-        # Look for either team in the odds dictionary
-        book_line = odds_map.get(h_code, odds_map.get(a_code, 0))
+        # --- MATCHING WITH FANDUEL ---
+        book_line = 0
+        # Fuzzy match team names (e.g. "Lakers" in "Los Angeles Lakers")
+        for team_full, line in odds_map.items():
+            if home['teamName'] in team_full or home['teamCity'] in team_full:
+                book_line = line
+                break
         
-        edge = 0
-        if book_line > 0:
-            edge = final_proj - book_line
+        edge = (savant_proj - book_line) if book_line > 0 else 0
 
         live_payload.append({
-            "Matchup": f"{a_code} @ {h_code}",
+            "Matchup": f"{away['teamTricode']} @ {home['teamTricode']}",
             "Qtr": game['period'],
-            "Min": round(minutes_played, 1),
-            "Score": current_score,
-            "Pace": round(live_pace, 1),
+            "Min": round(min_played, 1),
+            "Pace": round(pace, 1),
             "Fouls/Min": round(fpm, 2),
-            "Ref Mode": "🔒 TIGHT" if fpm > foul_threshold else "🔓 LOOSE",
-            "Savant Proj": round(final_proj, 1),
-            "Book Line": book_line,
+            "Ref Mode": "🔒 TIGHT" if fpm > 2.1 else "🔓 LOOSE",
+            "Savant Proj": round(savant_proj, 1),
+            "FanDuel Line": book_line,
             "EDGE": round(edge, 1)
         })
 
     return pd.DataFrame(live_payload)
 
 # --- MAIN APP EXECUTION ---
-
-# 1. Load User Odds
-odds_data = load_odds(uploaded_file)
-
-if not uploaded_file:
-    st.info("👋 Welcome to Savant NBA Live! Please upload your `Odds.json` in the sidebar to start scanning.")
-
-# 2. Run Engine if Odds are present OR just to see live stats
-if st.button("Run Scan Now") or uploaded_file:
-    with st.spinner("Fetching live NBA data..."):
-        df = get_live_savant_data(odds_data)
+with st.spinner("Fetching FanDuel Lines & Scanning Live Data..."):
+    # 1. Fetch FanDuel Odds
+    odds_data = fetch_live_odds()
+    
+    # 2. Fetch Live Stats
+    df = get_savant_data(odds_data)
     
     if not df.empty:
-        # --- DISPLAY STYLING ---
-        def highlight_edge(row):
-            styles = [''] * len(row)
-            if row['EDGE'] >= min_edge:
-                styles = ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row) # Green
-            elif row['EDGE'] <= -min_edge:
-                styles = ['background-color: #f8d7da; color: #721c24; font-weight: bold'] * len(row) # Red
-            return styles
-
-        st.success(f"Scanned {len(df)} Live Games")
+        st.success(f"Synced {len(df)} Live Games")
         
-        # Display the main table
+        # Styling
+        def highlight(row):
+            if row['EDGE'] >= min_edge:
+                return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row) # Green
+            elif row['EDGE'] <= -min_edge:
+                return ['background-color: #f8d7da; color: #721c24; font-weight: bold'] * len(row) # Red
+            return [''] * len(row)
+
         st.dataframe(
-            df.style.apply(highlight_edge, axis=1).format({
+            df.style.apply(highlight, axis=1).format({
                 "Pace": "{:.1f}", 
-                "Fouls/Min": "{:.2f}", 
                 "Savant Proj": "{:.1f}", 
-                "Book Line": "{:.1f}", 
+                "FanDuel Line": "{:.1f}", 
                 "EDGE": "{:.1f}"
-            }),
-            use_container_width=True,
-            height=500
+            }), 
+            use_container_width=True
         )
         
-        # --- ALERTS SECTION ---
-        st.subheader("🔥 Actionable Alerts")
-        found_alert = False
-        
-        col1, col2 = st.columns(2)
-        
-        for index, row in df.iterrows():
-            # OVER ALERT
-            if row['EDGE'] >= min_edge:
-                found_alert = True
-                with col1:
-                    st.success(f"**BET OVER: {row['Matchup']}**")
-                    st.write(f"Projection: **{row['Savant Proj']}** vs Book: **{row['Book Line']}**")
-                    st.write(f"Reason: Edge is +{row['EDGE']}")
-                    if "TIGHT" in row['Ref Mode']:
-                        st.write("➕ **Ref Factor:** High Fouls (Tight Whistle)")
-                    st.divider()
-            
-            # UNDER ALERT
-            elif row['EDGE'] <= -min_edge:
-                found_alert = True
-                with col2:
-                    st.error(f"**BET UNDER: {row['Matchup']}**")
-                    st.write(f"Projection: **{row['Savant Proj']}** vs Book: **{row['Book Line']}**")
-                    st.write(f"Reason: Edge is {row['EDGE']}")
-                    if "LOOSE" in row['Ref Mode']:
-                        st.write("➕ **Ref Factor:** Low Fouls (Game Moving Fast)")
-                    st.divider()
-
-        if not found_alert:
-            st.info(f"No edges found > {min_edge} points. The market is sharp right now.")
-            
+        # Alerts
+        for _, row in df.iterrows():
+            if abs(row['EDGE']) >= min_edge:
+                direction = "OVER" if row['EDGE'] > 0 else "UNDER"
+                st.markdown(f"### 🚨 BET {direction}: {row['Matchup']}")
+                st.write(f"Proj: **{row['Savant Proj']}** vs FanDuel: **{row['FanDuel Line']}**")
+                
+                if "TIGHT" in row['Ref Mode'] and direction == "OVER":
+                     st.write("➕ **Bonus:** Refs are calling it tight (Free Throws expected)")
+                st.divider()
     else:
-        st.warning("No active games found. (Are games in progress?)")
-      
+        st.info("No active games found. (Waiting for tip-off...)")
+        
