@@ -3,81 +3,78 @@ import pandas as pd
 import requests
 
 # --- CONFIGURATION ---
+# Your Verified Odds API Key
 API_KEY = "6b10d20e4323876f867026893e161475"
 FANDUEL_URL = "https://sportsbook.fanduel.com/navigation/basketball"
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant Global Basketball", page_icon="🌍", layout="wide")
-st.title("🌍 Savant Global: Live Pace Scanner")
+st.set_page_config(page_title="Savant Global HUD", page_icon="🏀", layout="wide")
+st.title("🏀 Savant Global: multi-League Scanner")
 
 # --- SIDEBAR: LEAGUE SELECTOR ---
 with st.sidebar:
     st.header("🏆 League Selection")
-    # Mapping friendly names to Odds API keys
     league_choice = st.selectbox(
         "Choose League",
         ["NBA", "EuroLeague", "CBA (China)", "NBL (Australia)"]
     )
     
+    # League Specific Mappings
     league_map = {
-        "NBA": "basketball_nba",
-        "EuroLeague": "basketball_euroleague",
-        "CBA (China)": "basketball_cba",
-        "NBL (Australia)": "basketball_nba_nbl"
+        "NBA": {"key": "basketball_nba", "len": 48, "coeff": 1.12},
+        "EuroLeague": {"key": "basketball_euroleague", "len": 40, "coeff": 0.96},
+        "CBA (China)": {"key": "basketball_cba", "len": 40, "coeff": 1.05},
+        "NBL (Australia)": {"key": "basketball_nba_nbl", "len": 40, "coeff": 1.02}
     }
-    selected_sport = league_map[league_choice]
+    
+    selected_config = league_map[league_choice]
 
     st.divider()
     
     st.header("⚙️ Strategy")
-    min_edge = st.slider("Min Edge", 1.0, 10.0, 4.0)
+    min_edge = st.slider("Min Edge (Pts)", 1.0, 10.0, 4.0)
     
-    if st.button("🚀 SCAN LIVE LEAGUE", type="primary"):
+    if st.button("🚀 SCAN LIVE MARKET", type="primary"):
         st.rerun()
 
 # --- ENGINE: FETCH ODDS & LIVE SCORES ---
-def fetch_global_data(sport_key):
-    # This endpoint pulls BOTH odds and live scores in one go
+def fetch_global_data(config):
+    sport_key = config['key']
+    game_max_min = config['len']
+    eff_coeff = config['coeff']
+    
+    # API Endpoints
     url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?apiKey={API_KEY}&regions=us&markets=totals&oddsFormat=american"
     score_url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores/?apiKey={API_KEY}&daysFrom=1"
     
     try:
-        # 1. Get Odds
         odds_res = requests.get(url).json()
-        # 2. Get Live Scores
         score_res = requests.get(score_url).json()
         
-        if 'message' in odds_res:
+        if isinstance(odds_res, dict) and 'message' in odds_res:
             st.error(f"API Error: {odds_res['message']}")
             return pd.DataFrame()
 
-        # Create a Score Map: { "Home Team": {"score": 100, "period": 3, "clock": 5} }
-        score_map = {s['home_team']: s for s in score_res if s['completed'] == False}
+        # Map live scores by home team
+        score_map = {s['home_team']: s for s in score_res if not s['completed']}
 
         payload = []
         for game in odds_res:
-            home_team = game['home_team']
-            away_team = game['away_team']
+            home_t = game['home_team']
+            away_t = game['away_team']
             
-            # Check if game is LIVE (exists in our score map)
-            if home_team in score_map:
-                live = score_map[home_team]
+            if home_t in score_map:
+                live = score_map[home_t]
                 
-                # Get Scores
-                h_score = int(next((s['score'] for s in live['scores'] if s['name'] == home_team), 0))
-                a_score = int(next((s['score'] for s in live['scores'] if s['name'] == away_team), 0))
-                curr_total = h_score + a_score
+                # Extract Scores
+                h_score = next((s['score'] for s in live['scores'] if s['name'] == home_t), 0)
+                a_score = next((s['score'] for s in live['scores'] if s['name'] == away_t), 0)
+                curr_total = int(h_score) + int(a_score)
                 
-                # Period/Time Logic (Varies by league)
-                # Euro/CBA are 40 min games. NBA is 48.
-                game_length = 40 if "nba" not in sport_key else 48
-                
-                # --- SAVANT PACE LOGIC ---
-                # Since free API doesn't give us raw possessions, we use 'Point Velocity'
-                # Formula: (Current Points / Minutes Played) * Full Game Minutes
-                # Assuming 10 mins per quarter for Euro/CBA
-                min_played = 20 # Placeholder: Free API often lags on exact clock. 
-                # Better to manually adjust this or use the 'last_update' timestamp.
+                # Time Estimation (Odds API provides 'last_update')
+                # For more accuracy, we assume we are at the halfway point if clock is missing
+                # Or you can manually input 'Minutes Played' in the sidebar
+                est_min_played = game_max_min / 2 
                 
                 # --- FETCH FANDUEL LINE ---
                 target_book = next((b for b in game['bookmakers'] if b['key'] == 'fanduel'), None)
@@ -86,50 +83,60 @@ def fetch_global_data(sport_key):
                 
                 line = 0
                 if target_book:
-                    for market in target_book['markets']:
-                        if market['key'] == 'totals':
-                            line = market['outcomes'][0]['point']
+                    market = next((m for m in target_book['markets'] if m['key'] == 'totals'), None)
+                    if market:
+                        line = market['outcomes'][0]['point']
 
-                # Savant Projection (Simple Velocity Model)
-                # Adjusted for league efficiency (CBA is high, Euro is low)
-                efficiency_coeff = 1.15 if "cba" in sport_key else 0.95
-                projection = (curr_total * 2.1) * efficiency_coeff # Rough scaling
+                # --- SAVANT PROJECTION LOGIC ---
+                # Fixed for 40 vs 48 minute differences
+                # Base Projection = (Current Score / Est Minutes) * Total Game Minutes
+                base_proj = (curr_total / est_min_played) * game_max_min
+                final_proj = base_proj * eff_coeff
                 
-                edge = projection - line if line > 0 else 0
+                edge = final_proj - line if line > 0 else 0
 
                 payload.append({
-                    "Matchup": f"{away_team} @ {home_team}",
-                    "Live Score": f"{a_score} - {h_score}",
-                    "Savant Proj": round(projection, 1),
+                    "Matchup": f"{away_t} @ {home_t}",
+                    "Score": f"{a_score}-{h_score}",
+                    "Savant Proj": round(final_proj, 1),
                     "FanDuel": line,
-                    "EDGE": round(edge, 1)
+                    "EDGE": round(edge, 1),
+                    "Type": "EURO/CBA (40m)" if game_max_min == 40 else "NBA (48m)"
                 })
 
         return pd.DataFrame(payload)
 
     except Exception as e:
-        st.error(f"Connection Error: {e}")
+        st.error(f"Scanner Error: {e}")
         return pd.DataFrame()
 
 # --- DISPLAY ---
-with st.spinner(f"Scanning {league_choice}..."):
-    df = fetch_global_data(selected_sport)
+with st.spinner(f"Analyzing {league_choice} Markets..."):
+    df = fetch_global_data(selected_config)
     
     if not df.empty:
-        def highlight(row):
+        # Sort by best EDGE
+        df = df.sort_values(by="EDGE", ascending=False)
+
+        def highlight_edge(row):
             if row['EDGE'] >= min_edge:
-                return ['background-color: #d4edda; color: #155724'] * len(row)
+                return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row)
             elif row['EDGE'] <= -min_edge:
-                return ['background-color: #f8d7da; color: #721c24'] * len(row)
+                return ['background-color: #f8d7da; color: #721c24; font-weight: bold'] * len(row)
             return [''] * len(row)
 
-        st.dataframe(df.style.apply(highlight, axis=1), use_container_width=True)
+        st.dataframe(df.style.apply(highlight_edge, axis=1), use_container_width=True)
         
+        # Action Alerts
         for _, row in df.iterrows():
             if abs(row['EDGE']) >= min_edge:
+                direction = "OVER" if row['EDGE'] > 0 else "UNDER"
                 with st.container(border=True):
-                    st.write(f"🚨 **{row['Matchup']}**")
-                    st.write(f"Proj: {row['Savant Proj']} | Book: {row['FanDuel']} | **Edge: {row['EDGE']}**")
-                    st.link_button("💰 OPEN FANDUEL", FANDUEL_URL)
+                    c1, c2 = st.columns([3, 1])
+                    with c1:
+                        st.write(f"### {direction}: {row['Matchup']}")
+                        st.write(f"**Savant:** {row['Savant Proj']} | **FanDuel:** {row['FanDuel']} | **Edge:** {row['EDGE']}")
+                    with c2:
+                        st.link_button("💰 BET NOW", FANDUEL_URL, use_container_width=True, type="primary")
     else:
-        st.info(f"No live {league_choice} games found right now. Check back during local game times!")
+        st.info(f"No live {league_choice} games found. Check game schedules for local tip-off times.")
