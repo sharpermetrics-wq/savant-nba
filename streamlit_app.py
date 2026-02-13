@@ -1,18 +1,16 @@
 import streamlit as st
 import pandas as pd
 import requests
-import time
 
 # --- CONFIG ---
 ODDS_API_KEY = "6b10d20e4323876f867026893e161475"
 FANDUEL_URL = "https://sportsbook.fanduel.com/navigation/basketball"
 
-st.set_page_config(page_title="Savant v4: Precision Clock", layout="wide")
-st.title("🏀 Savant v4: Real-Time Precision")
+st.set_page_config(page_title="Savant v4.1: Pro HUD", layout="wide")
+st.title("🏀 Savant Global: Precision HUD")
 
-# --- SIDEBAR ---
 with st.sidebar:
-    st.header("🏆 League Selection")
+    st.header("🏆 League")
     league_choice = st.selectbox("League", ["NBA", "EuroLeague", "CBA (China)"])
     league_map = {
         "NBA": {"odds_key": "basketball_nba", "len": 48, "coeff": 1.12},
@@ -25,27 +23,30 @@ with st.sidebar:
     if st.button("🚀 FORCE RE-SCAN", type="primary"):
         st.rerun()
 
-# --- THE "HIDDEN" SCRAPER ENGINE ---
-def get_realtime_clock_and_scores():
+def get_precision_scores():
     """
-    Taps into a high-speed live score endpoint.
-    This is much faster and more accurate than standard APIs.
+    New Hybrid Scraper: Uses Browser Headers to prevent 'string' errors.
     """
-    # Using a common public endpoint used by live-score widgets
     url = "https://prod-public-api.livescore.com/v1/api/react/live/basketball/0.00?MD=1"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
     try:
-        res = requests.get(url, timeout=5).json()
+        response = requests.get(url, headers=headers, timeout=10)
+        # Verify we got JSON and not an error string
+        if response.status_code != 200: return {}
+        data = response.json()
+        
         score_data = {}
-        for stage in res.get('Stages', []):
-            for event in stage.get('Events', []):
-                # We map by team name
-                home = event.get('T1', [{}])[0].get('Nm', 'Unknown')
-                score_data[home] = {
-                    "h_score": int(event.get('Tr1', 0)),
-                    "a_score": int(event.get('Tr2', 0)),
-                    "clock": event.get('Eps', '00:00'), # e.g., "34'" or "Q4 02:15"
-                    "status": event.get('Eps', '')
-                }
+        if isinstance(data, dict) and 'Stages' in data:
+            for stage in data['Stages']:
+                for event in stage.get('Events', []):
+                    home = event.get('T1', [{}])[0].get('Nm', 'Unknown')
+                    score_data[home] = {
+                        "h_score": int(event.get('Tr1', 0)) if event.get('Tr1') else 0,
+                        "a_score": int(event.get('Tr2', 0)) if event.get('Tr2') else 0,
+                        "clock": str(event.get('Eps', '00:00'))
+                    }
         return score_data
     except:
         return {}
@@ -55,43 +56,42 @@ def fetch_savant_data(config):
     
     try:
         odds_res = requests.get(odds_url).json()
-        live_scores = get_realtime_clock_and_scores()
+        live_scores = get_precision_scores()
         
         payload = []
+        # Error check: ensure odds_res is a list
+        if not isinstance(odds_res, list): return pd.DataFrame()
+
         for game in odds_res:
             home_t = game.get('home_team')
-            # Look for team match in live scores
             match = next((v for k, v in live_scores.items() if home_t in k or k in home_t), None)
             
             if match:
                 curr_total = match['h_score'] + match['a_score']
                 clock_raw = match['clock']
                 
-                # --- PRECISION CLOCK PARSER ---
-                # Converts strings like "38'" or "Q4 02:15" to exact decimal minutes
+                # PARSER
                 try:
-                    if "'" in clock_raw: # Format: "38'"
+                    if "'" in clock_raw:
                         mins_played = float(clock_raw.replace("'", ""))
-                    elif ":" in clock_raw: # Format: "Q4 02:15"
+                    elif ":" in clock_raw:
                         parts = clock_raw.split(' ')
-                        q_num = int(parts[0].replace('Q', ''))
-                        m, s = map(int, parts[1].split(':'))
+                        q_num = int(parts[0].replace('Q', '')) if 'Q' in parts[0] else 1
+                        m_str = parts[1] if len(parts) > 1 else parts[0]
+                        m, s = map(int, m_str.split(':'))
                         q_len = config['len'] / 4
                         mins_played = ((q_num - 1) * q_len) + (q_len - m - (s/60))
-                    else:
-                        mins_played = 0
-                except:
-                    mins_played = 0
+                    else: mins_played = 0
+                except: mins_played = 0
 
-                # Fetch Line
+                # Odds Lookup
                 line = 0
                 book = next((b for b in game.get('bookmakers', []) if b['key'] == 'fanduel'), None)
                 if book:
                     mkt = next((m for m in book.get('markets', []) if m['key'] == 'totals'), None)
                     if mkt: line = mkt['outcomes'][0]['point']
 
-                # --- THE SAVANT MATH ---
-                if mins_played > 1 and mins_played < (config['len'] - 0.5):
+                if 2 < mins_played < (config['len'] - 0.5):
                     ppm = curr_total / mins_played
                     mins_rem = config['len'] - mins_played
                     final_proj = curr_total + (ppm * mins_rem * config['coeff'])
@@ -100,19 +100,18 @@ def fetch_savant_data(config):
                     payload.append({
                         "Matchup": f"{game['away_team']} @ {home_t}",
                         "Score": f"{match['a_score']}-{match['h_score']}",
-                        "Exact Min": round(mins_played, 2),
+                        "Clock": clock_raw,
                         "Proj": round(final_proj, 1),
                         "Line": line,
                         "EDGE": edge
                     })
         return pd.DataFrame(payload)
-    except Exception as e:
-        st.error(f"Sync Error: {e}")
+    except:
         return pd.DataFrame()
 
-# --- DISPLAY ---
+# --- RUN ---
 df = fetch_savant_data(config)
 if not df.empty:
     st.dataframe(df.style.background_gradient(cmap='RdYlGn', subset=['EDGE']), use_container_width=True)
 else:
-    st.info("Waiting for live games to sync. Tip: Re-scan in 10 seconds.")
+    st.info(f"No LIVE {league_choice} games found. Note: CBA is currently on a FIBA break until late February.")
