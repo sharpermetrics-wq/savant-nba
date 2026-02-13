@@ -1,96 +1,102 @@
 import streamlit as st
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from apify_client import ApifyClient
+
+# --- SECURE CONFIG ---
+try:
+    APIFY_TOKEN = st.secrets["APIFY_TOKEN"]
+except:
+    st.error("Missing APIFY_TOKEN in Secrets!")
+    st.stop()
 
 # --- PAGE SETUP ---
-st.set_page_config(page_title="Savant v5.8: The NBB Fix", layout="wide")
-st.title("🏀 Savant v5.8: Overcoming 'Limited Coverage'")
+st.set_page_config(page_title="Savant v5.9: Hybrid Engine", layout="wide")
+st.title("🏀 Savant Global v5.9: Hybrid Automation")
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("🏆 League")
-    league_choice = st.selectbox("League", ["Brazil NBB", "NBA", "EuroLeague"])
+    st.header("🏆 League Selection")
+    league_choice = st.selectbox("League", ["NBA", "EuroLeague", "Brazil NBB"])
     
-    config = {
-        "Brazil NBB": {"len": 40, "coeff": 1.02},
-        "NBA": {"len": 48, "coeff": 1.12},
-        "EuroLeague": {"len": 40, "coeff": 0.94}
-    }[league_choice]
-
-    st.divider()
-    if st.button("🚀 FORCE RE-SCRAPE", type="primary"):
+    league_map = {
+        "NBA": {"val": "NBA", "len": 48, "coeff": 1.12, "auto_odds": True},
+        "EuroLeague": {"val": "UCL", "len": 40, "coeff": 0.94, "auto_odds": True},
+        "Brazil NBB": {"val": "BRAZIL", "len": 40, "coeff": 1.02, "auto_odds": False}
+    }
+    config = league_map[league_choice]
+    
+    if st.button("🚀 REFRESH LIVE DATA", type="primary"):
         st.rerun()
 
-# --- STEP 1: THE "COVERAGE BYPASS" SCRAPER ---
-def scrape_nbb_live():
-    # Using a more robust source for NBB Live Scores
-    url = "https://www.basketball24.com/brazil/nbb/"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
+# --- STEP 1: ODDS (NBA/EURO ONLY) ---
+def get_odds(league_val):
+    client = ApifyClient(APIFY_TOKEN)
     try:
-        response = requests.get(url, headers=headers)
-        # Basketball24 uses a specific format; we'll look for live score markers
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Note: Scrapers for these sites are complex because data is loaded via JS.
-        # As a failsafe, we'll use a direct "LiveScore" search filter
-        games = []
-        
-        # This is a fallback to the 'Live' pulse but with a 'Stage' override
-        pulse_url = "https://prod-public-api.livescore.com/v1/api/react/live/basketball/0.00?MD=1"
-        res = requests.get(pulse_url, headers=headers).json()
-        
-        for stage in res.get('Stages', []):
-            # Check for ANY Brazil or NBB marker in the stage
-            s_nm = stage.get('Snm', '').upper()
-            if "BRAZIL" in s_nm or "NBB" in s_nm:
-                for event in stage.get('Events', []):
-                    games.append({
-                        "home": event['T1'][0]['Nm'],
-                        "away": event['T2'][0]['Nm'],
-                        "h_score": int(event.get('Tr1', 0) or 0),
-                        "a_score": int(event.get('Tr2', 0) or 0),
-                        "clock": str(event.get('Eps', '00:00'))
-                    })
-        return games
-    except:
-        return []
+        run = client.actor("harvest/sportsbook-odds-scraper").call(run_input={"league": league_val, "sportsbook": "FanDuel"})
+        return {item['homeTeam']: item['odds'][0]['overUnder'] for item in client.dataset(run["defaultDatasetId"]).iterate_items() if item.get('odds')}
+    except: return {}
 
-# --- STEP 2: THE ENGINE ---
-with st.spinner("Bypassing API restrictions..."):
-    live_games = scrape_nbb_live()
+# --- STEP 2: GLOBAL SCORE PULSE ---
+def get_scores():
+    url = "https://prod-public-api.livescore.com/v1/api/react/live/basketball/0.00?MD=1"
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        res = requests.get(url, headers=headers).json()
+        games = []
+        for stage in res.get('Stages', []):
+            league_name = stage.get('Snm', '').upper()
+            for event in stage.get('Events', []):
+                games.append({
+                    "home": event['T1'][0]['Nm'],
+                    "h_score": int(event.get('Tr1', 0) or 0),
+                    "a_score": int(event.get('Tr2', 0) or 0),
+                    "clock": str(event.get('Eps', '00:00')),
+                    "league": league_name
+                })
+        return games
+    except: return []
+
+# --- STEP 3: THE ENGINE ---
+with st.spinner("Calculating Savant Projections..."):
+    odds_data = get_odds(config['val']) if config['auto_odds'] else {}
+    live_games = get_scores()
     results = []
 
     for game in live_games:
-        total = game['h_score'] + game['a_score']
-        clock = game['clock']
-        
-        # Clock logic
-        try:
-            if "'" in clock: mins = float(clock.replace("'", ""))
-            elif ":" in clock:
-                parts = clock.split(' ')
-                q = int(parts[0].replace('Q','')) if 'Q' in parts[0] else 1
-                m, s = map(int, parts[-1].split(':'))
-                mins = ((q-1) * 10) + (10 - m - (s/60))
-            elif "HT" in clock or "HALF" in clock: mins = 20.0
-            else: mins = 2.0 # Minimum play time
-        except: mins = 2.0
+        # Match based on League Name (Brazil, NBA, etc.)
+        if config['val'] in game['league'] or (league_choice == "Brazil NBB" and "NBB" in game['league']):
+            total = game['h_score'] + game['a_score']
+            clock = game['clock']
+            
+            # Clock Parser
+            try:
+                if ":" in clock:
+                    parts = clock.split(' ')
+                    q = int(parts[0].replace('Q','')) if 'Q' in parts[0] else 1
+                    m, s = map(int, parts[-1].split(':'))
+                    mins = ((q-1) * (config['len']/4)) + ((config['len']/4) - m - (s/60))
+                elif "HT" in clock or "HALF" in clock: mins = config['len'] / 2
+                else: mins = 5.0 # Fallback
+            except: mins = 5.0
 
-        if mins > 0:
-            proj = (total / mins) * config['len'] * config['coeff']
-            results.append({
-                "Game": f"{game['away']} @ {game['home']}",
-                "Score": f"{game['a_score']} - {game['h_score']}",
-                "Mins": round(mins, 1),
-                "Savant Proj": round(proj, 1)
-            })
+            if mins > 1:
+                proj = (total / mins) * config['len'] * config['coeff']
+                line = odds_data.get(game['home'], 0)
+                
+                results.append({
+                    "Matchup": game['home'],
+                    "Live Score": f"{game['a_score']}-{game['h_score']}",
+                    "Clock": clock,
+                    "Savant Proj": round(proj, 1),
+                    "FanDuel Line": line if line > 0 else "---",
+                    "EDGE": round(proj - line, 1) if line > 0 else "N/A"
+                })
 
 # --- DISPLAY ---
 if results:
     st.table(pd.DataFrame(results))
-    st.success("✅ NBB Data Successfully Injected")
+    if league_choice == "Brazil NBB":
+        st.info("Check FanDuel for the current Live Total. If it's below the Savant Proj, the play is OVER.")
 else:
-    st.error("No games currently tracking as 'Live' in the data feed.")
-    st.info("💡 **Manual Override:** Since the API is lagging on NBB, you can use the sidebar 'Manual' button from v5.6 to enter the score you see on TV.")
+    st.warning(f"No live {league_choice} games detected. Ensure games have tipped off.")
