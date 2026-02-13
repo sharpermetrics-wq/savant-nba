@@ -1,117 +1,97 @@
 import streamlit as st
 import pandas as pd
 import random
-import time
+
+# --- CONFIGURATION ---
+API_KEY = "6b10d20e4323876f867026893e161475"
+# FanDuel deep link for NBA
+FANDUEL_NBA_URL = "https://sportsbook.fanduel.com/navigation/nba"
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant NBA (SIM MODE)", page_icon="🏀", layout="wide")
-st.title("🏀 Savant NBA: Simulation Mode")
-st.markdown("### *Testing UI during All-Star Break*")
+st.set_page_config(page_title="Savant NBA (FanDuel)", page_icon="🏀", layout="wide")
+st.title("🏀 Savant NBA: FanDuel Edition")
 
 # --- SIDEBAR: SETTINGS ---
 with st.sidebar:
-    st.header("⚙️ Simulation Settings")
+    st.header("⚙️ Strategy")
     min_edge = st.slider("Min Edge to Bet", 1.0, 10.0, 4.0)
     
     st.divider()
     
-    if st.button("🔄 GENERATE NEW SIMULATION", type="primary"):
+    if st.button("🚀 SCAN FANDUEL LIVE", type="primary"):
         st.rerun()
     
-    st.info("⚠️ This mode uses FAKE data to test your layout.")
+    st.info("⚠️ Simulation Mode Active (All-Star Break)")
 
-# --- FUNCTION: GENERATE FAKE DATA ---
+# --- MOCK DATA ENGINE ---
 def get_mock_data():
-    # Create fake scenarios to test different alerts
     mock_games = [
-        # SCENARIO 1: Big EDGE OVER (Green Alert)
-        {"home": "LAL", "away": "BOS", "q": 4, "time": 5, "pace": 110.5, "fouls": 2.8, "book": 220.5},
-        
-        # SCENARIO 2: Big EDGE UNDER (Red Alert)
-        {"home": "NYK", "away": "MIA", "q": 3, "time": 10, "pace": 92.0, "fouls": 1.1, "book": 215.0},
-        
-        # SCENARIO 3: No Edge (Gray - Market is Sharp)
-        {"home": "GSW", "away": "PHX", "q": 2, "time": 2, "pace": 102.0, "fouls": 1.9, "book": 228.0},
-        
-        # SCENARIO 4: Tight Whistle Bonus
-        {"home": "DAL", "away": "OKC", "q": 4, "time": 8, "pace": 105.0, "fouls": 2.5, "book": 225.0}
+        {"home": "LAL", "away": "BOS", "pace": 110.5, "fouls": 2.8, "book": 222.5},
+        {"home": "NYK", "away": "MIA", "pace": 92.0, "fouls": 1.1, "book": 210.0},
+        {"home": "TOR", "away": "PHI", "pace": 104.0, "fouls": 2.4, "book": 218.5}
     ]
     
-    live_payload = []
-    
+    data = []
     for g in mock_games:
-        # 1. Fake Logic
-        pace = g['pace']
-        fpm = g['fouls']
-        
-        # 2. Fake Projection (Pace * 2.1 is rough approx for total points)
-        # Add random noise so it changes every time you click refresh
-        noise = random.uniform(-2, 2)
-        
-        # Ref Bonus: If fouls > 2.1, add 4 points
-        ref_boost = 4.0 if fpm > 2.1 else 0
-        
-        proj = (pace * 2.15) + ref_boost + noise
-        
-        # 3. Calculate Edge
+        # Savant Math
+        ref_boost = 4.5 if g['fouls'] > 2.1 else 0
+        proj = (g['pace'] * 2.12) + ref_boost + random.uniform(-3, 3)
         edge = proj - g['book']
 
-        live_payload.append({
+        data.append({
             "Matchup": f"{g['away']} @ {g['home']}",
-            "Qtr": g['q'],
-            "Min": g['time'],
-            "Pace": round(pace, 1),
-            "Fouls/Min": round(fpm, 2),
-            "Ref Mode": "🔒 TIGHT" if fpm > 2.1 else "🔓 LOOSE",
+            "Pace": round(g['pace'], 1),
+            "Fouls/Min": round(g['fouls'], 2),
+            "Ref Mode": "🔒 TIGHT" if g['fouls'] > 2.1 else "🔓 LOOSE",
             "Savant Proj": round(proj, 1),
             "FanDuel Line": g['book'],
             "EDGE": round(edge, 1)
         })
-
-    return pd.DataFrame(live_payload)
+    return pd.DataFrame(data)
 
 # --- MAIN APP EXECUTION ---
-with st.spinner("Simulating Live Games..."):
-    # 1. Get Mock Data
+with st.spinner("Checking FanDuel Lines..."):
     df = get_mock_data()
     
-    # 2. Display Table
     if not df.empty:
-        # Styling Logic
-        def highlight(row):
+        # Main Table Styling
+        def highlight_edge(row):
             if row['EDGE'] >= min_edge:
-                return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row) # Green
+                return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row)
             elif row['EDGE'] <= -min_edge:
-                return ['background-color: #f8d7da; color: #721c24; font-weight: bold'] * len(row) # Red
+                return ['background-color: #f8d7da; color: #721c24; font-weight: bold'] * len(row)
             return [''] * len(row)
 
-        st.success("Simulation Active: 4 Mock Games Loaded")
+        st.dataframe(df.style.apply(highlight_edge, axis=1), use_container_width=True)
         
-        st.dataframe(
-            df.style.apply(highlight, axis=1).format({
-                "Pace": "{:.1f}", 
-                "Savant Proj": "{:.1f}", 
-                "FanDuel Line": "{:.1f}", 
-                "EDGE": "{:.1f}"
-            }), 
-            use_container_width=True
-        )
-        
-        # 3. Alerts Section
+        # --- ALERTS & DEEP LINKS ---
         st.divider()
-        st.subheader("📢 Active Alerts")
+        st.subheader("📢 Live Betting Alerts")
         
+        # Display as cards for better mobile view on Pixel 9 Pro
         for _, row in df.iterrows():
             if abs(row['EDGE']) >= min_edge:
                 direction = "OVER" if row['EDGE'] > 0 else "UNDER"
                 
-                if direction == "OVER":
-                    st.success(f"**BET OVER: {row['Matchup']}**")
-                else:
-                    st.error(f"**BET UNDER: {row['Matchup']}**")
+                # Container for the alert
+                with st.container(border=True):
+                    col1, col2 = st.columns([2, 1])
                     
-                st.write(f"Proj: **{row['Savant Proj']}** vs Line: **{row['FanDuel Line']}** (Edge: {row['EDGE']})")
-                
-                if "TIGHT" in row['Ref Mode'] and direction == "OVER":
-                     st.caption("➕ **Ref Factor:** High Fouls (Tight Whistle detected)")
-                st.markdown("---")
+                    with col1:
+                        st.markdown(f"### {direction}: {row['Matchup']}")
+                        st.write(f"**Proj:** {row['Savant Proj']} | **Line:** {row['FanDuel Line']}")
+                        st.write(f"**Edge:** {row['EDGE']} pts")
+                        if "TIGHT" in row['Ref Mode']:
+                            st.caption("🔥 Ref Factor: Tight Whistle (Boosted Efficiency)")
+                    
+                    with col2:
+                        # Deep Link Button
+                        # This opens the FanDuel NBA page directly
+                        st.link_button(
+                            label=f"💰 BET {direction}",
+                            url=FANDUEL_NBA_URL,
+                            use_container_width=True,
+                            type="primary" if direction == "OVER" else "secondary"
+                        )
+    else:
+        st.info("No games currently meet your edge criteria.")
