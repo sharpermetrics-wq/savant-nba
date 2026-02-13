@@ -1,45 +1,82 @@
 import streamlit as st
 import pandas as pd
 import requests
+from apify_client import ApifyClient
 
-# --- CONFIG ---
-ODDS_API_KEY = "6b10d20e4323876f867026893e161475"
+# --- CONFIGURATION ---
+# Pulling the key from your Streamlit "Secrets" vault
+try:
+    APIFY_TOKEN = st.secrets["APIFY_TOKEN"]
+except KeyError:
+    st.error("Missing APIFY_TOKEN in Streamlit Secrets! Check your dashboard settings.")
+    st.stop()
+
 FANDUEL_URL = "https://sportsbook.fanduel.com/navigation/basketball"
 
-st.set_page_config(page_title="Savant v4.1: Pro HUD", layout="wide")
-st.title("🏀 Savant Global: Precision HUD")
+# --- PAGE SETUP ---
+st.set_page_config(page_title="Savant v5: Pro HUD", page_icon="🏀", layout="wide")
+st.title("🏀 Savant Global v5: Automation Build")
 
+# --- SIDEBAR ---
 with st.sidebar:
-    st.header("🏆 League")
-    league_choice = st.selectbox("League", ["NBA", "EuroLeague", "CBA (China)"])
+    st.header("🏆 League Selection")
+    league_choice = st.selectbox("Choose League", ["NBA", "EuroLeague", "Brazil NBB", "CBA (China)"])
+    
+    # League Specific Mappings for Logic
     league_map = {
-        "NBA": {"odds_key": "basketball_nba", "len": 48, "coeff": 1.12},
-        "EuroLeague": {"odds_key": "basketball_euroleague", "len": 40, "coeff": 0.94},
-        "CBA (China)": {"odds_key": "basketball_cba", "len": 40, "coeff": 1.05}
+        "NBA": {"odds_key": "NBA", "len": 48, "coeff": 1.12},
+        "EuroLeague": {"odds_key": "EuroLeague", "len": 40, "coeff": 0.94},
+        "Brazil NBB": {"odds_key": "Brazil-NBB", "len": 40, "coeff": 1.02},
+        "CBA (China)": {"odds_key": "CBA", "len": 40, "coeff": 1.05}
     }
     config = league_map[league_choice]
-    
+
     st.divider()
-    if st.button("🚀 FORCE RE-SCAN", type="primary"):
+    st.header("⚙️ Execution")
+    min_edge = st.slider("Min EDGE Trigger", 2.0, 10.0, 4.0)
+    
+    if st.button("🚀 FULL AUTO-SCAN", type="primary"):
         st.rerun()
 
-def get_precision_scores():
-    """
-    New Hybrid Scraper: Uses Browser Headers to prevent 'string' errors.
-    """
-    url = "https://prod-public-api.livescore.com/v1/api/react/live/basketball/0.00?MD=1"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+# --- STEP 1: PULL LIVE ODDS (APIFY) ---
+def get_automated_odds(league_name):
+    client = ApifyClient(APIFY_TOKEN)
+    
+    # Selecting the best source based on the league
+    # CBA and NBB often require Bet365/BetMGM for live lines
+    source_book = "FanDuel" if league_name in ["NBA", "EuroLeague"] else "Bet365"
+    
+    run_input = {
+        "league": league_name,
+        "sportsbook": source_book
     }
+    
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        # Verify we got JSON and not an error string
-        if response.status_code != 200: return {}
-        data = response.json()
+        # Calling the community-maintained sportsbook scraper
+        run = client.actor("harvest/sportsbook-odds-scraper").call(run_input=run_input)
+        odds_map = {}
         
+        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+            home = item.get('homeTeam', '')
+            for odd in item.get('odds', []):
+                if odd.get('type') == 'overUnder':
+                    odds_map[home] = odd.get('overUnder', 0)
+        return odds_map
+    except Exception as e:
+        st.warning(f"Apify Scraper delay or error: {e}")
+        return {}
+
+# --- STEP 2: PULL REAL-TIME SCORES & CLOCK ---
+def get_precision_scores():
+    # Scraping the high-speed JSON pulse from LiveScore.com
+    url = "https://prod-public-api.livescore.com/v1/api/react/live/basketball/0.00?MD=1"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=10).json()
         score_data = {}
-        if isinstance(data, dict) and 'Stages' in data:
-            for stage in data['Stages']:
+        if isinstance(res, dict) and 'Stages' in res:
+            for stage in res['Stages']:
                 for event in stage.get('Events', []):
                     home = event.get('T1', [{}])[0].get('Nm', 'Unknown')
                     score_data[home] = {
@@ -51,67 +88,73 @@ def get_precision_scores():
     except:
         return {}
 
-def fetch_savant_data(config):
-    odds_url = f"https://api.the-odds-api.com/v4/sports/{config['odds_key']}/odds/?apiKey={ODDS_API_KEY}&regions=us&markets=totals&oddsFormat=american"
+# --- STEP 3: THE SAVANT ENGINE ---
+with st.spinner(f"Synchronizing {league_choice} Markets..."):
+    # 1. Scrape the market for current lines
+    odds_data = get_automated_odds(config['odds_key'])
+    # 2. Scrape the game for the exact clock and score
+    live_data = get_precision_scores()
     
-    try:
-        odds_res = requests.get(odds_url).json()
-        live_scores = get_precision_scores()
+    results = []
+    for team, line in odds_data.items():
+        # Match team names (Fuzzy match: "Lakers" in "LA Lakers")
+        match = next((v for k, v in live_data.items() if team in k or k in team), None)
         
-        payload = []
-        # Error check: ensure odds_res is a list
-        if not isinstance(odds_res, list): return pd.DataFrame()
-
-        for game in odds_res:
-            home_t = game.get('home_team')
-            match = next((v for k, v in live_scores.items() if home_t in k or k in home_t), None)
+        if match and line > 0:
+            curr_total = match['h_score'] + match['a_score']
+            clock = match['clock']
             
-            if match:
-                curr_total = match['h_score'] + match['a_score']
-                clock_raw = match['clock']
-                
-                # PARSER
-                try:
-                    if "'" in clock_raw:
-                        mins_played = float(clock_raw.replace("'", ""))
-                    elif ":" in clock_raw:
-                        parts = clock_raw.split(' ')
-                        q_num = int(parts[0].replace('Q', '')) if 'Q' in parts[0] else 1
-                        m_str = parts[1] if len(parts) > 1 else parts[0]
-                        m, s = map(int, m_str.split(':'))
-                        q_len = config['len'] / 4
-                        mins_played = ((q_num - 1) * q_len) + (q_len - m - (s/60))
-                    else: mins_played = 0
-                except: mins_played = 0
+            # --- CLOCK PARSING LOGIC ---
+            try:
+                if "'" in clock: # Format: "34'"
+                    mins = float(clock.replace("'", ""))
+                elif ":" in clock: # Format: "Q3 04:30"
+                    q = int(clock.split(' ')[0].replace('Q','')) if 'Q' in clock else 1
+                    time_part = clock.split(' ')[-1]
+                    m, s = map(int, time_part.split(':'))
+                    q_len = config['len'] / 4
+                    mins = ((q-1) * q_len) + (q_len - m - (s/60))
+                else:
+                    mins = 0
+            except:
+                mins = 0
 
-                # Odds Lookup
-                line = 0
-                book = next((b for b in game.get('bookmakers', []) if b['key'] == 'fanduel'), None)
-                if book:
-                    mkt = next((m for m in book.get('markets', []) if m['key'] == 'totals'), None)
-                    if mkt: line = mkt['outcomes'][0]['point']
+            # --- THE SAVANT MATH ---
+            # Don't project until at least 2 minutes have been played to avoid spikes
+            if 2 < mins < (config['len'] - 0.5):
+                ppm = curr_total / mins
+                proj = curr_total + (ppm * (config['len'] - mins) * config['coeff'])
+                edge = round(proj - line, 1)
 
-                if 2 < mins_played < (config['len'] - 0.5):
-                    ppm = curr_total / mins_played
-                    mins_rem = config['len'] - mins_played
-                    final_proj = curr_total + (ppm * mins_rem * config['coeff'])
-                    edge = round(final_proj - line, 1)
+                results.append({
+                    "Matchup": team,
+                    "Score": f"{match['a_score']}-{match['h_score']}",
+                    "Clock": clock,
+                    "Savant Proj": round(proj, 1),
+                    "Live Line": line,
+                    "EDGE": edge
+                })
 
-                    payload.append({
-                        "Matchup": f"{game['away_team']} @ {home_t}",
-                        "Score": f"{match['a_score']}-{match['h_score']}",
-                        "Clock": clock_raw,
-                        "Proj": round(final_proj, 1),
-                        "Line": line,
-                        "EDGE": edge
-                    })
-        return pd.DataFrame(payload)
-    except:
-        return pd.DataFrame()
-
-# --- RUN ---
-df = fetch_savant_data(config)
-if not df.empty:
-    st.dataframe(df.style.background_gradient(cmap='RdYlGn', subset=['EDGE']), use_container_width=True)
+# --- DISPLAY OUTPUT ---
+if results:
+    df = pd.DataFrame(results).sort_values(by="EDGE", ascending=False)
+    
+    # Highlight the best edges
+    st.dataframe(
+        df.style.background_gradient(cmap='RdYlGn', subset=['EDGE']),
+        use_container_width=True
+    )
+    
+    # Direct Action Alerts
+    for _, row in df.iterrows():
+        if abs(row['EDGE']) >= min_edge:
+            with st.container(border=True):
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    direction = "OVER" if row['EDGE'] > 0 else "UNDER"
+                    st.write(f"### {direction}: {row['Matchup']}")
+                    st.write(f"**Proj:** {row['Savant Proj']} | **Bookie:** {row['Live Line']} | **Edge:** {row['EDGE']} pts")
+                with col2:
+                    st.link_button("💰 BET NOW", FANDUEL_URL, type="primary")
 else:
-    st.info(f"No LIVE {league_choice} games found. Note: CBA is currently on a FIBA break until late February.")
+    st.info(f"No active {league_choice} games with data found. If you see a live game on FanDuel, re-scan in a moment.")
