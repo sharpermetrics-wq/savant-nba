@@ -17,7 +17,8 @@ st.markdown("### *Live Pace & Referee Arb Engine*")
 # --- SIDEBAR: SETTINGS & UPLOAD ---
 with st.sidebar:
     st.header("1. Upload Odds")
-    uploaded_file = st.file_uploader("Drop your 'Odds.json' here", type=['json'])
+    uploaded_file = st.file_uploader("Upload Odds File", accept_multiple_files=False)
+
     
     st.divider()
     
