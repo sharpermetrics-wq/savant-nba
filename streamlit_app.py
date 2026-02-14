@@ -7,8 +7,8 @@ from apify_client import ApifyClient
 from datetime import datetime
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant v48: Type-Safe", layout="wide")
-st.title("🏀 Savant v48: Stability Patch")
+st.set_page_config(page_title="Savant v49: Instant Slip", layout="wide")
+st.title("🏀 Savant v49: The Instant Slip")
 
 # --- SECRETS & SETUP ---
 try:
@@ -102,7 +102,7 @@ def fetch_deep(game_id, league):
     try: return requests.get(url, timeout=4).json()
     except: return {}
 
-# --- MAIN EXECUTION ---
+# --- CONTROLS (TOP OF SIDEBAR) ---
 with st.sidebar:
     st.header("⚙️ Controls")
     league_choice = st.selectbox("League", ["College (NCAAB)", "NBA"], key="league_choice")
@@ -117,7 +117,7 @@ with st.sidebar:
     if st.button("🔄 REFRESH DATA", type="primary"):
         st.rerun()
 
-# --- FETCH DATA ---
+# --- MAIN EXECUTION ---
 data = fetch_data(league_choice)
 live_games = []
 events = data.get('events', [])
@@ -158,14 +158,10 @@ if live_games:
     for i, game in enumerate(live_games):
         progress.progress((i + 1) / len(live_games))
         
-        # --- THE FIX: Type-Safe Clock Logic ---
         try:
             if ":" in game['clock']: m, s = map(int, game['clock'].split(':'))
             else: m, s = 0, 0
-            
-            # FORCE INTEGER CASTING
             p = int(game['period']) 
-            
             mins = 0.0
             if league_choice == "NBA":
                 if p <= 4: mins = ((p-1)*12) + (12 - m - (s/60))
@@ -175,8 +171,7 @@ if live_games:
                 elif p == 2: mins = 20.0 + (20.0 - m - (s/60))
                 else: mins = 40.0 + ((p-2)*5) - m - (s/60)
         except: 
-            mins = 0.0
-            p = 1 # Safe default if parsing fails
+            mins = 0.0; p = 1
         
         if mins > 2.0:
             deep_raw = fetch_deep(game['id'], league_choice)
@@ -204,7 +199,6 @@ if live_games:
                         try: deep['deep_total'] = float(p_idx['overUnder']); break
                         except: continue
 
-            # LINE LOGIC
             final_line = 0.0
             h_norm = normalize_name(game['home_team']); a_norm = normalize_name(game['away_team'])
             if h_norm in st.session_state.apify_odds: final_line = st.session_state.apify_odds[h_norm]
@@ -221,7 +215,6 @@ if live_games:
                 rem = FULL_TIME - mins
                 final_line = curr_score + (opener * (rem / FULL_TIME))
 
-            # SAVANT MATH
             total_score = game['home'] + game['away']
             base_proj = (total_score / mins) * FULL_TIME
             fpm = deep['fouls'] / mins
@@ -229,9 +222,7 @@ if live_games:
             
             comeback_adj = 0.0
             status = ""
-            # The line that crashed is now safe because 'p' is strictly an int
             is_second_half = (league_choice == "NBA" and p >= 3) or (league_choice != "NBA" and p >= 2)
-            
             if is_second_half and game['spread'] <= fav_threshold:
                 fav = 0; dog = 0
                 if game['fav_team'] == game['home_abb']: fav = game['home']; dog = game['away']
@@ -241,7 +232,6 @@ if live_games:
                     comeback_adj = deficit * 0.5
                     status = f"⚠️ {game['fav_team']} Down {deficit}"
             
-            # Volatility (Blind Spot Fix)
             orb_val = deep['orb']
             if orb_val == 0 and deep['fga'] > 0: orb_val = deep['fga'] * 0.20
             raw_poss = deep['fga'] - orb_val + deep['tov'] + (0.44 * deep['fta'])
@@ -266,7 +256,7 @@ if live_games:
                 if bet['ID'] == game['id']: is_tracked = True; break
             
             results.append({
-                "Track": is_tracked,
+                "Add": is_tracked, # Renamed "Track" to "Add" for clarity
                 "ID": game['id'],
                 "Matchup": game['matchup'],
                 "Score": f"{game['away']}-{game['home']}",
@@ -280,36 +270,14 @@ if live_games:
             })
     progress.empty()
 
-# --- SIDEBAR: LIVE BET SLIP ---
-with st.sidebar:
-    st.divider()
-    st.subheader("📝 Live Bet Slip")
-    if st.session_state.bet_slip:
-        if st.button("🗑️ Clear All Bets"):
-            st.session_state.bet_slip = []
-            st.rerun()
-            
-        for bet in st.session_state.bet_slip:
-            live_data = live_game_map.get(bet['ID'], {"Score": "Final/HT", "Time": "--", "Proj": 0})
-            curr_proj = live_data['Proj']
-            status = "⚪"
-            if curr_proj > 0:
-                if bet['Pick'] == "OVER": status = "✅ WIN" if curr_proj > bet['Line'] else "❌ LOSS"
-                else: status = "✅ WIN" if curr_proj < bet['Line'] else "❌ LOSS"
-            
-            st.markdown(f"**{bet['Matchup']}**")
-            st.caption(f"{bet['Pick']} {bet['Line']} | Entry: {bet['Entry_Proj']}")
-            st.caption(f"{status} | Live: **{curr_proj}** ({live_data['Score']})")
-            st.divider()
-    else: st.info("No active bets.")
-
-# --- MAIN DASHBOARD ---
+# --- RENDER TABLE ---
 if results:
     df = pd.DataFrame(results).sort_values('SortEdge', ascending=False)
+    
     edited_df = st.data_editor(
         df,
         column_config={
-            "Track": st.column_config.CheckboxColumn("Bet?", width="small"),
+            "Add": st.column_config.CheckboxColumn("Add", width="small", help="Check to add to Bet Slip"),
             "Line": st.column_config.NumberColumn("Line (Edit)", format="%.1f"),
             "EDGE": st.column_config.NumberColumn("Edge", format="%.1f"),
             "Savant": st.column_config.NumberColumn("Proj", format="%.1f"),
@@ -323,22 +291,58 @@ if results:
         key="main_dashboard"
     )
     
+    # --- LOGIC UPDATE ---
+    # We update Session State immediately based on the Table Edits
     for index, row in edited_df.iterrows():
+        # Sticky Lines
         if row['Line'] > 0 and row['Line'] != st.session_state.sticky_lines.get(row['ID']):
             st.session_state.sticky_lines[row['ID']] = row['Line']
-        if row['Track']:
+        
+        # Bet Slip Logic
+        if row['Add']:
+            # If Checked -> Add
             exists = False
             for bet in st.session_state.bet_slip:
                 if bet['ID'] == row['ID']: exists = True; break
+            
             if not exists:
                 pick = "OVER" if row['EDGE'] > 0 else "UNDER"
                 st.session_state.bet_slip.append({
                     "ID": row['ID'], "Matchup": row['Matchup'], "Pick": pick,
                     "Line": row['Line'], "Entry_Proj": row['Savant']
                 })
-                st.rerun()
         else:
+            # If Unchecked -> Remove
             for i, bet in enumerate(st.session_state.bet_slip):
                 if bet['ID'] == row['ID']:
                     st.session_state.bet_slip.pop(i)
-                    st.rerun()
+                    break
+
+# --- SIDEBAR: LIVE BET SLIP (NOW RENDERED LAST) ---
+# Because this is at the bottom of the script, it "sees" the updates from the loop above instantly.
+with st.sidebar:
+    st.divider()
+    st.subheader("📝 Live Bet Slip")
+    
+    if st.session_state.bet_slip:
+        if st.button("🗑️ Clear All Bets"):
+            st.session_state.bet_slip = []
+            st.rerun()
+            
+        for bet in st.session_state.bet_slip:
+            live_data = live_game_map.get(bet['ID'], {"Score": "Final", "Time": "End", "Proj": 0})
+            curr_proj = live_data['Proj']
+            
+            status = "⚪"
+            if curr_proj > 0:
+                if bet['Pick'] == "OVER":
+                    status = "✅ WIN" if curr_proj > bet['Line'] else "❌ LOSS"
+                else:
+                    status = "✅ WIN" if curr_proj < bet['Line'] else "❌ LOSS"
+            
+            st.markdown(f"**{bet['Matchup']}**")
+            st.caption(f"{bet['Pick']} {bet['Line']} | Entry: {bet['Entry_Proj']}")
+            st.caption(f"{status} | Live: **{curr_proj}** ({live_data['Score']})")
+            st.divider()
+    else:
+        st.info("No active bets.")
