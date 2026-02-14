@@ -7,8 +7,8 @@ from apify_client import ApifyClient
 from datetime import datetime
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant v47: Sportsbook Layout", layout="wide")
-st.title("🏀 Savant v47: The Sportsbook Layout")
+st.set_page_config(page_title="Savant v48: Type-Safe", layout="wide")
+st.title("🏀 Savant v48: Stability Patch")
 
 # --- SECRETS & SETUP ---
 try:
@@ -125,7 +125,6 @@ if events:
     for event in events:
         if event['status']['type']['state'] == 'in':
             comp = event['competitions'][0]
-            # Parse Spread
             spread = 0.0; fav_team = ""
             try:
                 for odd in comp.get('odds', []):
@@ -150,7 +149,7 @@ if events:
 
 # --- PROCESSING ---
 results = []
-live_game_map = {} # To update sidebar
+live_game_map = {} 
 
 if live_games:
     FULL_TIME = 48.0 if league_choice == "NBA" else 40.0
@@ -159,11 +158,14 @@ if live_games:
     for i, game in enumerate(live_games):
         progress.progress((i + 1) / len(live_games))
         
-        # Clock
+        # --- THE FIX: Type-Safe Clock Logic ---
         try:
             if ":" in game['clock']: m, s = map(int, game['clock'].split(':'))
             else: m, s = 0, 0
-            p = game['period']
+            
+            # FORCE INTEGER CASTING
+            p = int(game['period']) 
+            
             mins = 0.0
             if league_choice == "NBA":
                 if p <= 4: mins = ((p-1)*12) + (12 - m - (s/60))
@@ -172,13 +174,14 @@ if live_games:
                 if p == 1: mins = 20.0 - m - (s/60)
                 elif p == 2: mins = 20.0 + (20.0 - m - (s/60))
                 else: mins = 40.0 + ((p-2)*5) - m - (s/60)
-        except: mins = 0.0
+        except: 
+            mins = 0.0
+            p = 1 # Safe default if parsing fails
         
         if mins > 2.0:
             deep_raw = fetch_deep(game['id'], league_choice)
-            
-            # Parse Deep Stats
             deep = {"fouls":0, "fga":0, "fta":0, "orb":0, "tov":0, "deep_total": 0.0}
+            
             if 'boxscore' in deep_raw and 'teams' in deep_raw['boxscore']:
                 for team in deep_raw['boxscore']['teams']:
                     for stat in team.get('statistics', []):
@@ -196,9 +199,9 @@ if live_games:
                         if "free" in nm or "ft" in lbl: deep['fta'] += val
             
             if 'pickcenter' in deep_raw:
-                for p in deep_raw['pickcenter']:
-                    if 'overUnder' in p:
-                        try: deep['deep_total'] = float(p['overUnder']); break
+                for p_idx in deep_raw['pickcenter']:
+                    if 'overUnder' in p_idx:
+                        try: deep['deep_total'] = float(p_idx['overUnder']); break
                         except: continue
 
             # LINE LOGIC
@@ -226,7 +229,9 @@ if live_games:
             
             comeback_adj = 0.0
             status = ""
+            # The line that crashed is now safe because 'p' is strictly an int
             is_second_half = (league_choice == "NBA" and p >= 3) or (league_choice != "NBA" and p >= 2)
+            
             if is_second_half and game['spread'] <= fav_threshold:
                 fav = 0; dog = 0
                 if game['fav_team'] == game['home_abb']: fav = game['home']; dog = game['away']
@@ -250,7 +255,6 @@ if live_games:
             
             edge = round(proj - final_line, 1)
             
-            # Map for Sidebar
             live_game_map[game['id']] = {
                 "Score": f"{game['away']}-{game['home']}",
                 "Time": f"Q{p} {game['clock']}" if league_choice == "NBA" else f"{p}H {game['clock']}",
@@ -276,40 +280,32 @@ if live_games:
             })
     progress.empty()
 
-# --- SIDEBAR: LIVE BET SLIP (ALWAYS VISIBLE) ---
+# --- SIDEBAR: LIVE BET SLIP ---
 with st.sidebar:
     st.divider()
     st.subheader("📝 Live Bet Slip")
-    
     if st.session_state.bet_slip:
         if st.button("🗑️ Clear All Bets"):
             st.session_state.bet_slip = []
             st.rerun()
             
-        live_slip = []
         for bet in st.session_state.bet_slip:
-            live_data = live_game_map.get(bet['ID'], {"Score": "Final", "Time": "End", "Proj": 0})
+            live_data = live_game_map.get(bet['ID'], {"Score": "Final/HT", "Time": "--", "Proj": 0})
             curr_proj = live_data['Proj']
-            
-            # Calc Status
             status = "⚪"
             if curr_proj > 0:
-                if bet['Pick'] == "OVER":
-                    status = "✅ WIN" if curr_proj > bet['Line'] else "❌ LOSS"
-                else:
-                    status = "✅ WIN" if curr_proj < bet['Line'] else "❌ LOSS"
+                if bet['Pick'] == "OVER": status = "✅ WIN" if curr_proj > bet['Line'] else "❌ LOSS"
+                else: status = "✅ WIN" if curr_proj < bet['Line'] else "❌ LOSS"
             
             st.markdown(f"**{bet['Matchup']}**")
             st.caption(f"{bet['Pick']} {bet['Line']} | Entry: {bet['Entry_Proj']}")
             st.caption(f"{status} | Live: **{curr_proj}** ({live_data['Score']})")
             st.divider()
-    else:
-        st.info("No active bets.")
+    else: st.info("No active bets.")
 
 # --- MAIN DASHBOARD ---
 if results:
     df = pd.DataFrame(results).sort_values('SortEdge', ascending=False)
-    
     edited_df = st.data_editor(
         df,
         column_config={
@@ -327,15 +323,10 @@ if results:
         key="main_dashboard"
     )
     
-    # Process Edits & Checks
     for index, row in edited_df.iterrows():
-        # Sticky Lines
         if row['Line'] > 0 and row['Line'] != st.session_state.sticky_lines.get(row['ID']):
             st.session_state.sticky_lines[row['ID']] = row['Line']
-        
-        # Track/Untrack
         if row['Track']:
-            # Add if not exists
             exists = False
             for bet in st.session_state.bet_slip:
                 if bet['ID'] == row['ID']: exists = True; break
@@ -347,7 +338,6 @@ if results:
                 })
                 st.rerun()
         else:
-            # Remove if exists (Uncheck)
             for i, bet in enumerate(st.session_state.bet_slip):
                 if bet['ID'] == row['ID']:
                     st.session_state.bet_slip.pop(i)
