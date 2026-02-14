@@ -1,27 +1,38 @@
 import streamlit as st
 import pandas as pd
 import requests
+import re
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant v17: Action Mode", layout="wide")
-st.title("🏀 Savant v17: Direct Action Mode")
+st.set_page_config(page_title="Savant v18: Odds Hunter", layout="wide")
+st.title("🏀 Savant v18: The 'Odds Hunter'")
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("🏆 League")
     league_choice = st.selectbox("League", ["College (NCAAB)", "NBA"])
     
-    if st.button("🚀 SCAN MARKET", type="primary"):
+    if st.button("🚀 FORCE REFRESH", type="primary"):
         st.rerun()
+    
+    st.info("ℹ️ Tip: If a line shows '0.0', double-click the cell in the table to type it in manually.")
 
-# --- STEP 1: GET ACTIVE GAMES (DEEP SCAN) ---
+# --- HELPER: TEXT PARSER ---
+def extract_ou_from_text(text):
+    # Looks for pattern "O/U 145.5" or "145.5 O/U"
+    try:
+        match = re.search(r'O/U\s*(\d+\.?\d*)', text, re.IGNORECASE)
+        if match: return float(match.group(1))
+        return 0.0
+    except: return 0.0
+
+# --- STEP 1: GET GAMES & ODDS (AGGRESSIVE) ---
 def get_live_games(league):
-    # Set the URL and the FanDuel Link based on league
     if league == "NBA":
         url = "http://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?limit=100"
         fd_url = "https://sportsbook.fanduel.com/navigation/nba"
     else:
-        # groups=50 unlocks ALL Division I games
+        # groups=50 unlocks ALL Division I
         url = "http://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?groups=50&limit=1000"
         fd_url = "https://sportsbook.fanduel.com/navigation/ncaab"
     
@@ -34,25 +45,31 @@ def get_live_games(league):
             status = event['status']['type']['state']
             
             if status == 'in':
-                # --- ODDS FIX: Scan ALL providers, not just the first one ---
+                # --- THE FIX: AGGRESSIVE ODDS HUNTING ---
                 line = 0.0
-                if 'odds' in comp:
-                    for odd_provider in comp['odds']:
-                        if 'overUnder' in odd_provider:
-                            try:
-                                line = float(odd_provider['overUnder'])
-                                break # Stop once we find a valid line
-                            except: continue
                 
+                # Method A: dedicated 'overUnder' float
+                if 'odds' in comp:
+                    for odd in comp['odds']:
+                        if odd.get('overUnder'):
+                            line = float(odd['overUnder'])
+                            break
+                        # Method B: Parse 'details' string (e.g. "UK -5.0, O/U 155.5")
+                        if 'details' in odd:
+                            val = extract_ou_from_text(odd['details'])
+                            if val > 0: 
+                                line = val
+                                break
+
                 games.append({
                     "id": event['id'],
                     "matchup": event['name'],
-                    "clock": event['status']['displayClock'],
+                    "clock_raw": event['status']['displayClock'],
                     "period": event['status']['period'],
                     "home_score": int(comp['competitors'][0]['score']),
                     "away_score": int(comp['competitors'][1]['score']),
-                    "line": line,
-                    "fd_link": fd_url # The direct link to FanDuel
+                    "line": line, # Might be 0.0 if totally missing
+                    "fd_link": fd_url
                 })
         return games
     except: return []
@@ -68,7 +85,6 @@ def get_box_stats(game_id, league):
         if 'boxscore' in res and 'teams' in res['boxscore']:
             for team in res['boxscore']['teams']:
                 for stat in team.get('statistics', []):
-                    # Robust parsing for "20-55" format
                     val = 0.0
                     try:
                         raw = stat.get('displayValue', '0')
@@ -87,25 +103,24 @@ def get_box_stats(game_id, league):
     except: return stats
 
 # --- STEP 3: THE ENGINE ---
-with st.spinner("Analyzing Live Games..."):
+with st.spinner("Hunting Odds..."):
     active_games = get_live_games(league_choice)
 
 if not active_games:
     st.info(f"No active {league_choice} games found.")
 else:
-    # Progress bar for deep scanning
+    # Progress Bar
     progress_bar = st.progress(0)
     results = []
     
-    # Constants
     FULL_TIME = 48.0 if league_choice == "NBA" else 40.0
     
     for i, game in enumerate(active_games):
         progress_bar.progress((i + 1) / len(active_games))
         
-        # 1. Parse Clock
+        # Clock Logic
         try:
-            if ":" in game['clock']: m, s = map(int, game['clock'].split(':'))
+            if ":" in game['clock_raw']: m, s = map(int, game['clock_raw'].split(':'))
             else: m, s = 0, 0
             
             p = game['period']
@@ -129,22 +144,18 @@ else:
             pace = poss / mins
             off_rtg = total / poss if poss > 0 else 0
             
-            # Ref Adjustment
             ref_adj = (fpm - 1.2) * 10.0 if fpm > 1.2 else 0
             proj = (pace * FULL_TIME * off_rtg) + ref_adj
             
-            line = game['line']
-            edge = proj - line if line > 0 else 0
-
+            # We calculate edge later in the display loop to handle manual edits
             results.append({
                 "Matchup": game['matchup'],
                 "Score": f"{game['away_score']}-{game['home_score']}",
-                "Clock": f"P{game['period']} {game['clock']}",
+                "Time": f"{round(mins,1)}",
                 "FPM": round(fpm, 2),
                 "Savant Proj": round(proj, 1),
-                "Bookie Line": line if line > 0 else "---",
-                "EDGE": round(edge, 1) if line > 0 else -999, # -999 for sorting if no line
-                "Action": game['fd_link']
+                "Line": game['line'], # KEEP AS FLOAT FOR EDITING
+                "Link": game['fd_link']
             })
             
     progress_bar.empty()
@@ -152,30 +163,39 @@ else:
     if results:
         df = pd.DataFrame(results)
         
-        # Sort by absolute edge size
-        if not df.empty:
-            df['sort'] = df['EDGE'].abs()
-            df = df.sort_values('sort', ascending=False).drop(columns=['sort'])
-            
-            # Replace the -999 placeholder with "N/A" for display
-            df['EDGE'] = df['EDGE'].apply(lambda x: x if x != -999 else "N/A")
-
-        # --- DISPLAY WITH CLICKABLE LINKS ---
-        st.dataframe(
+        st.markdown("### 📊 Live Board (Double-click 'Line' to edit)")
+        
+        # --- EDITABLE TABLE ---
+        # This allows you to fix the "0.0" lines yourself
+        edited_df = st.data_editor(
             df,
             column_config={
-                "Action": st.column_config.LinkColumn(
-                    "Bet Now",
-                    help="Open FanDuel Live",
-                    display_text="Open FanDuel 📲"
-                ),
-                "EDGE": st.column_config.NumberColumn(
-                    "Edge",
-                    format="%.1f",
-                )
+                "Link": st.column_config.LinkColumn("Bet", display_text="FanDuel 📲"),
+                "Line": st.column_config.NumberColumn("Line (Edit Me)", required=True),
+                "Savant Proj": st.column_config.NumberColumn("Proj", format="%.1f"),
+                "FPM": st.column_config.NumberColumn("Ref Factor", format="%.2f")
             },
+            disabled=["Matchup", "Score", "Time", "FPM", "Savant Proj", "Link"],
             use_container_width=True,
             hide_index=True
         )
-    else:
-        st.warning("Games found, but none have passed the 2-minute threshold.")
+        
+        # --- REAL-TIME EDGE CALCULATION ---
+        # We calculate the edge based on the *Edited* dataframe
+        if not edited_df.empty:
+            # Add EDGE column dynamically
+            edited_df['EDGE'] = edited_df.apply(
+                lambda row: round(row['Savant Proj'] - row['Line'], 1) if row['Line'] > 0 else 0.0, 
+                axis=1
+            )
+            
+            # Show the "Best Bets" below the table
+            best_bets = edited_df[edited_df['EDGE'].abs() > 4.0].sort_values(by='EDGE', key=abs, ascending=False)
+            
+            if not best_bets.empty:
+                st.divider()
+                st.subheader("🚨 SAVANT ALERTS")
+                for _, row in best_bets.iterrows():
+                    color = "green" if row['EDGE'] > 0 else "red"
+                    direction = "OVER" if row['EDGE'] > 0 else "UNDER"
+                    st.markdown(f":{color}[**{row['Matchup']}**]: Bet **{direction}** (Edge: {row['EDGE']})")
