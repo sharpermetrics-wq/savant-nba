@@ -7,8 +7,8 @@ from apify_client import ApifyClient
 from datetime import datetime
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant v49: Instant Slip", layout="wide")
-st.title("🏀 Savant v49: The Instant Slip")
+st.set_page_config(page_title="Savant v50: Force Sync", layout="wide")
+st.title("🏀 Savant v50: The Sync Fix")
 
 # --- SECRETS & SETUP ---
 try:
@@ -102,7 +102,7 @@ def fetch_deep(game_id, league):
     try: return requests.get(url, timeout=4).json()
     except: return {}
 
-# --- CONTROLS (TOP OF SIDEBAR) ---
+# --- CONTROLS (TOP SIDEBAR) ---
 with st.sidebar:
     st.header("⚙️ Controls")
     league_choice = st.selectbox("League", ["College (NCAAB)", "NBA"], key="league_choice")
@@ -134,7 +134,7 @@ if events:
             except: pass
             
             live_games.append({
-                "id": event['id'],
+                "id": str(event['id']), # FORCE STRING ID
                 "matchup": event['name'],
                 "clock": event['status']['displayClock'],
                 "period": event['status']['period'],
@@ -159,190 +159,4 @@ if live_games:
         progress.progress((i + 1) / len(live_games))
         
         try:
-            if ":" in game['clock']: m, s = map(int, game['clock'].split(':'))
-            else: m, s = 0, 0
-            p = int(game['period']) 
-            mins = 0.0
-            if league_choice == "NBA":
-                if p <= 4: mins = ((p-1)*12) + (12 - m - (s/60))
-                else: mins = 48.0 + ((p-4)*5) - m - (s/60)
-            else: 
-                if p == 1: mins = 20.0 - m - (s/60)
-                elif p == 2: mins = 20.0 + (20.0 - m - (s/60))
-                else: mins = 40.0 + ((p-2)*5) - m - (s/60)
-        except: 
-            mins = 0.0; p = 1
-        
-        if mins > 2.0:
-            deep_raw = fetch_deep(game['id'], league_choice)
-            deep = {"fouls":0, "fga":0, "fta":0, "orb":0, "tov":0, "deep_total": 0.0}
-            
-            if 'boxscore' in deep_raw and 'teams' in deep_raw['boxscore']:
-                for team in deep_raw['boxscore']['teams']:
-                    for stat in team.get('statistics', []):
-                        nm = stat.get('name', '').lower(); lbl = stat.get('label', '').lower()
-                        val = 0.0
-                        try:
-                            raw = stat.get('displayValue', '0')
-                            if "-" in raw: val = float(raw.split('-')[1])
-                            else: val = float(raw)
-                        except: val = 0.0
-                        if "foul" in nm or "pf" in lbl: deep['fouls'] += val
-                        if "offensive" in nm or "orb" in lbl: deep['orb'] += val
-                        if "turnover" in nm or "to" in lbl: deep['tov'] += val
-                        if ("field" in nm or "fg" in lbl) and not ("three" in nm or "3pt" in lbl): deep['fga'] += val
-                        if "free" in nm or "ft" in lbl: deep['fta'] += val
-            
-            if 'pickcenter' in deep_raw:
-                for p_idx in deep_raw['pickcenter']:
-                    if 'overUnder' in p_idx:
-                        try: deep['deep_total'] = float(p_idx['overUnder']); break
-                        except: continue
-
-            final_line = 0.0
-            h_norm = normalize_name(game['home_team']); a_norm = normalize_name(game['away_team'])
-            if h_norm in st.session_state.apify_odds: final_line = st.session_state.apify_odds[h_norm]
-            elif a_norm in st.session_state.apify_odds: final_line = st.session_state.apify_odds[a_norm]
-            
-            sticky = st.session_state.sticky_lines.get(game['id'], 0.0)
-            if sticky > 0: final_line = sticky
-            
-            if final_line == 0.0:
-                if deep['deep_total'] > 100 and game['id'] not in st.session_state.opening_totals:
-                    st.session_state.opening_totals[game['id']] = deep['deep_total']
-                opener = st.session_state.opening_totals.get(game['id'], 145.0)
-                curr_score = game['home'] + game['away']
-                rem = FULL_TIME - mins
-                final_line = curr_score + (opener * (rem / FULL_TIME))
-
-            total_score = game['home'] + game['away']
-            base_proj = (total_score / mins) * FULL_TIME
-            fpm = deep['fouls'] / mins
-            ref_adj = (fpm - 1.0) * 8.0 if fpm > 1.0 else 0 
-            
-            comeback_adj = 0.0
-            status = ""
-            is_second_half = (league_choice == "NBA" and p >= 3) or (league_choice != "NBA" and p >= 2)
-            if is_second_half and game['spread'] <= fav_threshold:
-                fav = 0; dog = 0
-                if game['fav_team'] == game['home_abb']: fav = game['home']; dog = game['away']
-                elif game['fav_team'] == game['away_abb']: fav = game['away']; dog = game['home']
-                deficit = dog - fav
-                if deficit > 0:
-                    comeback_adj = deficit * 0.5
-                    status = f"⚠️ {game['fav_team']} Down {deficit}"
-            
-            orb_val = deep['orb']
-            if orb_val == 0 and deep['fga'] > 0: orb_val = deep['fga'] * 0.20
-            raw_poss = deep['fga'] - orb_val + deep['tov'] + (0.44 * deep['fta'])
-            if raw_poss < 1: raw_poss = 1
-            ppp = total_score / raw_poss
-            vol_flag = "🔥" if ppp > 1.25 else ("❄️" if ppp < 0.80 else "-")
-            
-            proj = base_proj + ref_adj + comeback_adj
-            diff = abs(game['home'] - game['away'])
-            if is_second_half and diff <= 6: proj += 4.0
-            
-            edge = round(proj - final_line, 1)
-            
-            live_game_map[game['id']] = {
-                "Score": f"{game['away']}-{game['home']}",
-                "Time": f"Q{p} {game['clock']}" if league_choice == "NBA" else f"{p}H {game['clock']}",
-                "Proj": round(proj, 1)
-            }
-            
-            is_tracked = False
-            for bet in st.session_state.bet_slip:
-                if bet['ID'] == game['id']: is_tracked = True; break
-            
-            results.append({
-                "Add": is_tracked, # Renamed "Track" to "Add" for clarity
-                "ID": game['id'],
-                "Matchup": game['matchup'],
-                "Score": f"{game['away']}-{game['home']}",
-                "Time": f"Q{p} {game['clock']}" if league_choice == "NBA" else f"{p}H {game['clock']}",
-                "Line": round(final_line, 1),
-                "Savant": round(proj, 1),
-                "EDGE": edge,
-                "Vol": vol_flag,
-                "Alert": status,
-                "SortEdge": abs(edge)
-            })
-    progress.empty()
-
-# --- RENDER TABLE ---
-if results:
-    df = pd.DataFrame(results).sort_values('SortEdge', ascending=False)
-    
-    edited_df = st.data_editor(
-        df,
-        column_config={
-            "Add": st.column_config.CheckboxColumn("Add", width="small", help="Check to add to Bet Slip"),
-            "Line": st.column_config.NumberColumn("Line (Edit)", format="%.1f"),
-            "EDGE": st.column_config.NumberColumn("Edge", format="%.1f"),
-            "Savant": st.column_config.NumberColumn("Proj", format="%.1f"),
-            "Vol": st.column_config.TextColumn("Vol", width="small"),
-            "Alert": st.column_config.TextColumn("Alerts"),
-            "ID": None, "SortEdge": None
-        },
-        disabled=["Matchup", "Score", "Time", "Vol", "Alert", "Savant", "EDGE"],
-        use_container_width=True,
-        hide_index=True,
-        key="main_dashboard"
-    )
-    
-    # --- LOGIC UPDATE ---
-    # We update Session State immediately based on the Table Edits
-    for index, row in edited_df.iterrows():
-        # Sticky Lines
-        if row['Line'] > 0 and row['Line'] != st.session_state.sticky_lines.get(row['ID']):
-            st.session_state.sticky_lines[row['ID']] = row['Line']
-        
-        # Bet Slip Logic
-        if row['Add']:
-            # If Checked -> Add
-            exists = False
-            for bet in st.session_state.bet_slip:
-                if bet['ID'] == row['ID']: exists = True; break
-            
-            if not exists:
-                pick = "OVER" if row['EDGE'] > 0 else "UNDER"
-                st.session_state.bet_slip.append({
-                    "ID": row['ID'], "Matchup": row['Matchup'], "Pick": pick,
-                    "Line": row['Line'], "Entry_Proj": row['Savant']
-                })
-        else:
-            # If Unchecked -> Remove
-            for i, bet in enumerate(st.session_state.bet_slip):
-                if bet['ID'] == row['ID']:
-                    st.session_state.bet_slip.pop(i)
-                    break
-
-# --- SIDEBAR: LIVE BET SLIP (NOW RENDERED LAST) ---
-# Because this is at the bottom of the script, it "sees" the updates from the loop above instantly.
-with st.sidebar:
-    st.divider()
-    st.subheader("📝 Live Bet Slip")
-    
-    if st.session_state.bet_slip:
-        if st.button("🗑️ Clear All Bets"):
-            st.session_state.bet_slip = []
-            st.rerun()
-            
-        for bet in st.session_state.bet_slip:
-            live_data = live_game_map.get(bet['ID'], {"Score": "Final", "Time": "End", "Proj": 0})
-            curr_proj = live_data['Proj']
-            
-            status = "⚪"
-            if curr_proj > 0:
-                if bet['Pick'] == "OVER":
-                    status = "✅ WIN" if curr_proj > bet['Line'] else "❌ LOSS"
-                else:
-                    status = "✅ WIN" if curr_proj < bet['Line'] else "❌ LOSS"
-            
-            st.markdown(f"**{bet['Matchup']}**")
-            st.caption(f"{bet['Pick']} {bet['Line']} | Entry: {bet['Entry_Proj']}")
-            st.caption(f"{status} | Live: **{curr_proj}** ({live_data['Score']})")
-            st.divider()
-    else:
-        st.info("No active bets.")
+            if ":" in game['clock']: m, s = map(int
