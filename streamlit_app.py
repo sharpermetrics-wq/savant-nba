@@ -7,119 +7,118 @@ from apify_client import ApifyClient
 try:
     APIFY_TOKEN = st.secrets["APIFY_TOKEN"]
 except:
-    st.error("Missing APIFY_TOKEN in Secrets!")
+    st.error("Missing APIFY_TOKEN! Check Streamlit Secrets.")
     st.stop()
 
-# --- PAGE SETUP ---
-st.set_page_config(page_title="Savant v6.7: Rivalry Build", layout="wide")
-st.title("🏀 Savant Global v6.7: Ohio vs Miami (OH) Fix")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Savant v9.0: Raw Feed", layout="wide")
+st.title("🏀 Savant Global v9.0: The Unfiltered Feed")
 
-# --- SIDEBAR ---
 with st.sidebar:
-    st.header("🏆 League Selection")
-    league_choice = st.selectbox("League", ["College (NCAAB)", "NBA", "EuroLeague", "Brazil NBB"])
-    
-    league_map = {
-        "NBA": {"apify": "NBA", "tag": "NBA", "len": 48, "coeff": 1.12},
-        "EuroLeague": {"apify": "UCL", "tag": "UCL", "len": 40, "coeff": 0.94},
-        "Brazil NBB": {"apify": "BRAZIL", "tag": "BRAZIL", "len": 40, "coeff": 1.02},
-        "College (NCAAB)": {"apify": "College-Basketball", "tag": "NCAA", "len": 40, "coeff": 1.08}
-    }
-    config = league_map[league_choice]
-
-    st.divider()
-    # Adding a manual "Team Search" to force find a specific game
-    target_team = st.text_input("🎯 Target Team (Optional)", "OHIO").upper()
-    
-    if st.button("🚀 FORCE SYNC", type="primary"):
+    st.header("⚙️ Controls")
+    if st.button("🚀 REFRESH FEED", type="primary"):
         st.rerun()
+    
+    st.divider()
+    st.info("Showing ALL live games. No filters.")
 
-# --- STEP 1: APYFY ODDS ---
-def get_apify_odds(league_code):
-    if league_choice == "Brazil NBB": return {}
-    client = ApifyClient(APIFY_TOKEN)
-    try:
-        run = client.actor("harvest/sportsbook-odds-scraper").call(run_input={"league": league_code, "sportsbook": "FanDuel"})
-        odds = {}
-        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
-            home = item.get('homeTeam', '')
-            for odd in item.get('odds', []):
-                if odd.get('type') == 'overUnder':
-                    odds[home] = odd.get('overUnder', 0)
-        return odds
-    except: return {}
-
-# --- STEP 2: GLOBAL SCORE PULSE ---
-def get_scores():
+# --- STEP 1: FETCH RAW FEED ---
+def get_live_games():
+    # The '0.00' endpoint pulls all live games for the current UTC day
     url = "https://prod-public-api.livescore.com/v1/api/react/live/basketball/0.00?MD=1"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get(url, headers=headers, timeout=12).json()
+        res = requests.get(url, headers=headers, timeout=15).json()
         games = []
+        
         if 'Stages' in res:
             for stage in res['Stages']:
-                stage_name = stage.get('Snm', '').upper()
+                # Capture the raw league name (e.g. "USA - Mid-American Conference")
+                league_name = stage.get('Snm', 'Unknown')
+                
                 for event in stage.get('Events', []):
                     games.append({
-                        "home": event['T1'][0]['Nm'].upper(),
-                        "away": event['T2'][0]['Nm'].upper(),
+                        "league": league_name,
+                        "home": event['T1'][0]['Nm'],
+                        "away": event['T2'][0]['Nm'],
                         "h_score": int(event.get('Tr1', 0) or 0),
                         "a_score": int(event.get('Tr2', 0) or 0),
                         "clock": str(event.get('Eps', '00:00')),
-                        "league": stage_name
+                        "eid": event.get('Eid')
                     })
         return games
-    except: return []
+    except Exception as e:
+        st.error(f"Feed Error: {e}")
+        return []
 
-# --- STEP 3: THE ENGINE ---
-with st.spinner(f"Analyzing {league_choice}..."):
-    odds_data = get_apify_odds(config['apify'])
-    live_games = get_scores()
+# --- STEP 2: CALCULATE PROJECTIONS ---
+with st.spinner("Pulling global live data..."):
+    live_games = get_live_games()
     results = []
 
     for game in live_games:
-        # MATCHING LOGIC: Search by League Tag OR Manual Team Search
-        is_league_match = (config['tag'] in game['league']) or ("USA" in game['league'] and league_choice == "College (NCAAB)")
-        is_manual_match = (target_team in game['home'] or target_team in game['away']) if target_team else False
+        total = game['h_score'] + game['a_score']
+        clock = game['clock']
+        league = game['league'].upper()
         
-        if is_league_match or is_manual_match:
-            total = game['h_score'] + game['a_score']
-            clock = game['clock']
-            
-            try:
-                # Normalizing NCAA format (20m halves vs 10m quarters)
-                if ":" in clock:
-                    parts = clock.split(' ')
-                    q_val = parts[0].replace('Q','')
-                    q = int(q_val) if q_val.isdigit() else 1
-                    m, s = map(int, parts[-1].split(':'))
-                    # If 'Q' is present, use 10m; otherwise, assume 20m half
-                    p_len = 10 if "Q" in clock else 20
-                    mins = ((q-1) * p_len) + (p_len - m - (s/60))
-                elif "HT" in clock or "HALF" in clock: mins = 20.0
-                else: mins = 5.0
-                
-                if mins > 1.0:
-                    proj = (total / mins) * config['len'] * config['coeff']
-                    
-                    # Fuzzy match for odds
-                    line = 0
-                    for k, v in odds_data.items():
-                        if k.upper() in game['home'] or game['home'] in k.upper():
-                            line = v
-                            break
-                    
-                    results.append({
-                        "Matchup": f"{game['away']} @ {game['home']}",
-                        "Score": f"{game['a_score']}-{game['h_score']}",
-                        "Clock": clock,
-                        "Savant Proj": round(proj, 1),
-                        "Line": line if line > 0 else "---",
-                        "EDGE": round(proj - line, 1) if line > 0 else "N/A"
-                    })
-            except: continue
+        # --- AUTO-DETECT SETTINGS ---
+        # NBA games are 48 mins; almost everything else (NCAA, NBB, Euro) is 40 mins
+        if "NBA" in league and "G LEAGUE" not in league:
+            full_time = 48.0
+            coeff = 1.12
+        else:
+            full_time = 40.0
+            coeff = 1.08 # Default to slightly conservative for NCAA/Intl
 
+        # --- UNIVERSAL CLOCK PARSER ---
+        try:
+            mins_played = 0.0
+            
+            # Scenario A: Quarters (e.g., "Q3 04:30")
+            if "Q" in clock and ":" in clock:
+                parts = clock.split(' ')
+                q = int(parts[0].replace('Q',''))
+                m, s = map(int, parts[-1].split(':'))
+                q_len = full_time / 4
+                mins_played = ((q-1) * q_len) + (q_len - m - (s/60))
+
+            # Scenario B: Halves (NCAA) - e.g., "14:30 1st Half"
+            elif ("1" in clock or "2" in clock) and ":" in clock and "Q" not in clock:
+                # NCAA uses count-down from 20:00
+                m, s = map(int, clock.split(' ')[0].split(':'))
+                if "1" in clock: # 1st Half
+                    mins_played = 20 - m - (s/60)
+                else: # 2nd Half
+                    mins_played = 20 + (20 - m - (s/60))
+            
+            # Scenario C: Halftime
+            elif "HT" in clock or "HALF" in clock:
+                mins_played = full_time / 2
+
+            # Only show games that have actually started (more than 2 mins in)
+            if mins_played > 2.0:
+                proj = (total / mins_played) * full_time * coeff
+                
+                results.append({
+                    "League": game['league'], # Visible so you know where it's coming from
+                    "Matchup": f"{game['away']} @ {game['home']}",
+                    "Score": f"{game['a_score']}-{game['h_score']}",
+                    "Clock": clock,
+                    "Proj Total": round(proj, 1)
+                })
+        except:
+            continue
+
+# --- DISPLAY ---
 if results:
-    st.table(pd.DataFrame(results).sort_values(by="Savant Proj", ascending=False))
+    # Sort by League to group them nicely
+    df = pd.DataFrame(results).sort_values(by="League")
+    
+    st.success(f"Tracking {len(results)} live games.")
+    st.dataframe(df, use_container_width=True, hide_index=True)
 else:
-    st.info(f"Searching for {target_team}... Tip: If the game just tipped off, wait 2 mins for data to populate.")
+    st.warning("No live games found. (If games are scheduled, they may not have tipped off yet).")
+    # Debug: Show raw list if empty
+    if live_games:
+        st.write("Debug - Raw Games Found (but filtered by clock):")
+        st.write(live_games)
