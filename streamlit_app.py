@@ -2,22 +2,19 @@ import streamlit as st
 import pandas as pd
 import requests
 import re
+import time
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant v20: Bookie Hunter", layout="wide")
-st.title("🏀 Savant v20: The Bookie Hunter")
+st.set_page_config(page_title="Savant v21: Fresh Lines", layout="wide")
+st.title("🏀 Savant v21: Real-Time Odds")
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("🏆 League")
     league_choice = st.selectbox("League", ["College (NCAAB)", "NBA"])
     
-    # BIG REFRESH BUTTON
-    if st.button("🔄 REFRESH LINES & SCORES", type="primary"):
+    if st.button("🔄 FORCE REFRESH LINES", type="primary"):
         st.rerun()
-    
-    st.divider()
-    st.caption("ℹ️ Priority: FanDuel > DraftKings > ESPN BET > Others")
 
 # --- HELPER: TEXT PARSER ---
 def parse_ou(text):
@@ -29,11 +26,14 @@ def parse_ou(text):
 
 # --- STEP 1: GET ACTIVE GAMES ---
 def get_live_games(league):
+    # Add timestamp to URL to prevent caching
+    ts = int(time.time())
+    
     if league == "NBA":
-        url = "http://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?limit=100"
+        url = f"http://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?limit=100&t={ts}"
         fd_url = "https://sportsbook.fanduel.com/navigation/nba"
     else:
-        url = "http://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?groups=50&limit=1000"
+        url = f"http://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?groups=50&limit=1000&t={ts}"
         fd_url = "https://sportsbook.fanduel.com/navigation/ncaab"
     
     try:
@@ -44,7 +44,7 @@ def get_live_games(league):
                 games.append({
                     "id": event['id'],
                     "matchup": event['name'],
-                    "clock_raw": event['status']['displayClock'],
+                    "clock_display": event['status']['displayClock'], # e.g. "12:45"
                     "period": event['status']['period'],
                     "home": int(event['competitions'][0]['competitors'][0]['score']),
                     "away": int(event['competitions'][0]['competitors'][1]['score']),
@@ -53,10 +53,12 @@ def get_live_games(league):
         return games
     except: return []
 
-# --- STEP 2: GET DEEP DATA & BOOKIE HUNT ---
+# --- STEP 2: GET DEEP DATA (CACHE BUSTED) ---
 def get_game_data(game_id, league):
     sport_path = "basketball/nba" if league == "NBA" else "basketball/mens-college-basketball"
-    url = f"http://site.api.espn.com/apis/site/v2/sports/{sport_path}/summary?event={game_id}"
+    # Timestamp added here too
+    ts = int(time.time())
+    url = f"http://site.api.espn.com/apis/site/v2/sports/{sport_path}/summary?event={game_id}&t={ts}"
     
     data = {
         "fouls": 0, "fga": 0, "fta": 0, "orb": 0, "tov": 0, 
@@ -85,12 +87,12 @@ def get_game_data(game_id, league):
                     if "offensive" in nm or "orb" in lbl: data['orb'] += val
                     if "turnover" in nm or "to" in lbl: data['tov'] += val
 
-        # B. BOOKIE HUNTING (Priority Logic)
+        # B. BOOKIE HUNTING
         found_fd = False
         found_dk = False
         
         if 'pickcenter' in res:
-            # Pass 1: Look for FanDuel specifically
+            # 1. Look for FanDuel
             for provider in res['pickcenter']:
                 name = provider.get('provider', {}).get('name', '').lower()
                 if 'fanduel' in name and 'overUnder' in provider:
@@ -103,7 +105,7 @@ def get_game_data(game_id, league):
                             break
                     except: continue
             
-            # Pass 2: Look for DraftKings if no FanDuel
+            # 2. Look for DraftKings
             if not found_fd:
                 for provider in res['pickcenter']:
                     name = provider.get('provider', {}).get('name', '').lower()
@@ -117,7 +119,7 @@ def get_game_data(game_id, league):
                                 break
                         except: continue
 
-            # Pass 3: Take ANYTHING if neither found
+            # 3. Fallback
             if not found_fd and not found_dk:
                 for provider in res['pickcenter']:
                     if 'overUnder' in provider:
@@ -125,7 +127,6 @@ def get_game_data(game_id, league):
                             val = float(provider['overUnder'])
                             if val > 100:
                                 data['line'] = val
-                                # Shorten "Caesars Sportsbook" to "Caesars"
                                 raw_name = provider.get('provider', {}).get('name', 'Gen')
                                 data['book'] = raw_name.replace(" Sportsbook", "").replace("ESPN BET", "ESPN")
                                 break
@@ -135,7 +136,7 @@ def get_game_data(game_id, league):
     except: return data
 
 # --- STEP 3: EXECUTION ---
-with st.spinner("Hunting Odds (Priority: FanDuel > DK)..."):
+with st.spinner("Refreshing Lines & Clocks..."):
     active_games = get_live_games(league_choice)
 
 if not active_games:
@@ -148,8 +149,9 @@ else:
     for i, game in enumerate(active_games):
         progress_bar.progress((i + 1) / len(active_games))
         
+        # --- CLOCK PARSER (FOR MATH) ---
         try:
-            if ":" in game['clock_raw']: m, s = map(int, game['clock_raw'].split(':'))
+            if ":" in game['clock_display']: m, s = map(int, game['clock_display'].split(':'))
             else: m, s = 0, 0
             
             p = game['period']
@@ -158,7 +160,7 @@ else:
             if league_choice == "NBA":
                 if p <= 4: mins = ((p-1)*12) + (12 - m - (s/60))
                 else: mins = 48.0 + ((p-4)*5) - m - (s/60)
-            else: 
+            else: # College
                 if p == 1: mins = 20.0 - m - (s/60)
                 elif p == 2: mins = 20.0 + (20.0 - m - (s/60))
                 else: mins = 40.0 + ((p-2)*5) - m - (s/60)
@@ -179,11 +181,20 @@ else:
             line = game_data['line']
             edge = round(proj - line, 1) if line > 0 else -999.0
 
+            # --- DISPLAY FORMATTING ---
+            # Format period: "1H", "2H", "Q1"
+            if league_choice == "NBA":
+                p_str = f"Q{p}" if p <= 4 else f"OT{p-4}"
+            else:
+                p_str = f"{p}H" if p <= 2 else f"OT{p-2}"
+                
+            clean_clock = f"{p_str} {game['clock_display']}"
+
             results.append({
                 "Matchup": game['matchup'],
                 "Score": f"{game['away']}-{game['home']}",
-                "Time": f"{round(mins,1)}",
-                "Book": game_data['book'],  # NEW COLUMN
+                "Time": clean_clock,  # NOW HUMAN READABLE
+                "Book": game_data['book'],
                 "Line": line,
                 "Savant Proj": round(proj, 1),
                 "EDGE": edge,
@@ -195,7 +206,7 @@ else:
     if results:
         df = pd.DataFrame(results)
         
-        # Sort by Absolute Edge
+        # Sort
         df['sort_val'] = df['EDGE'].apply(lambda x: abs(x) if x != -999 else 0)
         df = df.sort_values('sort_val', ascending=False).drop(columns=['sort_val'])
         
@@ -206,7 +217,8 @@ else:
                 "Line": st.column_config.NumberColumn("Line (Edit)", required=True, format="%.1f"),
                 "EDGE": st.column_config.NumberColumn("Edge", format="%.1f"),
                 "Savant Proj": st.column_config.NumberColumn("Proj", format="%.1f"),
-                "Book": st.column_config.TextColumn("Bookie", disabled=True)
+                "Book": st.column_config.TextColumn("Bookie", disabled=True),
+                "Time": st.column_config.TextColumn("Clock", disabled=True)
             },
             disabled=["Matchup", "Score", "Time", "Book", "Savant Proj", "EDGE", "Link"],
             use_container_width=True,
