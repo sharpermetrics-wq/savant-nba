@@ -11,105 +11,101 @@ except:
     st.stop()
 
 # --- PAGE SETUP ---
-st.set_page_config(page_title="Savant v6.5: Validated", layout="wide")
-st.title("🏀 Savant Global v6.5: Validation Fix")
+st.set_page_config(page_title="Savant v6.6: Deep Scan", layout="wide")
+st.title("🏀 Savant Global v6.6: NCAAB Deep Scan")
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("🏆 League Selection")
     league_choice = st.selectbox("League", ["College (NCAAB)", "NBA", "EuroLeague", "Brazil NBB"])
     
-    # --- FIXED MAPPING ---
-    # The 'apify_code' MUST match the actor's allowed values exactly.
     league_map = {
-        "NBA": {"apify_code": "NBA", "score_tag": "NBA", "len": 48, "coeff": 1.12, "auto": True},
-        "EuroLeague": {"apify_code": "UCL", "score_tag": "UCL", "len": 40, "coeff": 0.94, "auto": True},
-        "Brazil NBB": {"apify_code": "BRAZIL", "score_tag": "BRAZIL", "len": 40, "coeff": 1.02, "auto": False},
-        "College (NCAAB)": {"apify_code": "College-Basketball", "score_tag": "NCAA", "len": 40, "coeff": 1.08, "auto": True}
+        "NBA": {"apify": "NBA", "tag": "NBA", "len": 48, "coeff": 1.12},
+        "EuroLeague": {"apify": "UCL", "tag": "UCL", "len": 40, "coeff": 0.94},
+        "Brazil NBB": {"apify": "BRAZIL", "tag": "BRAZIL", "len": 40, "coeff": 1.02},
+        "College (NCAAB)": {"apify": "College-Basketball", "tag": "NCAA", "len": 40, "coeff": 1.08}
     }
     config = league_map[league_choice]
 
     st.divider()
-    if st.button("🚀 FULL SYNC SCAN", type="primary"):
+    if st.button("🚀 FORCE DEEP SYNC", type="primary"):
         st.rerun()
 
-# --- STEP 1: APYFY ODDS SCRAPER ---
+# --- STEP 1: APYFY ODDS ---
 def get_apify_odds(league_code):
-    if not config['auto']: return {}
+    if league_choice == "Brazil NBB": return {}
     client = ApifyClient(APIFY_TOKEN)
-    
-    run_input = {
-        "league": league_code, # This will now be "College-Basketball"
-        "sportsbook": "FanDuel" 
-    }
-    
     try:
-        run = client.actor("harvest/sportsbook-odds-scraper").call(run_input=run_input)
-        odds_map = {}
+        run = client.actor("harvest/sportsbook-odds-scraper").call(run_input={"league": league_code, "sportsbook": "FanDuel"})
+        odds = {}
         for item in client.dataset(run["defaultDatasetId"]).iterate_items():
             home = item.get('homeTeam', '')
             for odd in item.get('odds', []):
                 if odd.get('type') == 'overUnder':
-                    odds_map[home] = odd.get('overUnder', 0)
-        return odds_map
-    except Exception as e:
-        # We display the actual error if it fails again
-        st.error(f"Apify Error: {e}")
-        return {}
+                    odds[home] = odd.get('overUnder', 0)
+        return odds
+    except: return {}
 
 # --- STEP 2: GLOBAL SCORE PULSE ---
 def get_scores():
     url = "https://prod-public-api.livescore.com/v1/api/react/live/basketball/0.00?MD=1"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        res = requests.get(url, headers=headers).json()
+        res = requests.get(url, headers=headers, timeout=12).json()
         games = []
-        for stage in res.get('Stages', []):
-            s_nm = stage.get('Snm', '').upper()
-            for event in stage.get('Events', []):
-                games.append({
-                    "home": event['T1'][0]['Nm'],
-                    "h_score": int(event.get('Tr1', 0) or 0),
-                    "a_score": int(event.get('Tr2', 0) or 0),
-                    "clock": str(event.get('Eps', '00:00')),
-                    "league": s_nm
-                })
+        # DEEP SCAN: Look through every stage in the response
+        if 'Stages' in res:
+            for stage in res['Stages']:
+                stage_name = stage.get('Snm', '').upper()
+                for event in stage.get('Events', []):
+                    games.append({
+                        "home": event['T1'][0]['Nm'],
+                        "h_score": int(event.get('Tr1', 0) or 0),
+                        "a_score": int(event.get('Tr2', 0) or 0),
+                        "clock": str(event.get('Eps', '00:00')),
+                        "league": stage_name
+                    })
         return games
     except: return []
 
 # --- STEP 3: THE ENGINE ---
-with st.spinner(f"Scraping {config['apify_code']}..."):
-    odds_data = get_apify_odds(config['apify_code'])
+with st.spinner(f"Scanning all stages for {league_choice}..."):
+    odds_data = get_apify_odds(config['apify'])
     live_games = get_scores()
     results = []
 
+    # Display count for user reassurance
+    st.caption(f"System found {len(live_games)} total basketball games live globally.")
+
     for game in live_games:
-        # Match against our league tag
-        if config['score_tag'] in game['league'] or (league_choice == "College (NCAAB)" and "NCAA" in game['league']):
+        # Match 'NCAA', 'USA', or specific league tags
+        is_match = (config['tag'] in game['league']) or \
+                   (league_choice == "College (NCAAB)" and "USA" in game['league'])
+        
+        if is_match:
             total = game['h_score'] + game['a_score']
             clock = game['clock']
             
             try:
+                # Normalizing the NCAAB 40m clock
                 if ":" in clock:
                     parts = clock.split(' ')
                     q_val = parts[0].replace('Q','')
                     q = int(q_val) if q_val.isdigit() else 1
-                    m_parts = parts[-1].split(':')
-                    m, s = int(m_parts[0]), int(m_parts[1])
-                    
+                    m, s = map(int, parts[-1].split(':'))
                     p_len = config['len'] / 4 if "Q" in clock else config['len'] / 2
                     mins = ((q-1) * p_len) + (p_len - m - (s/60))
-                elif "HT" in clock or "HALF" in clock: mins = config['len'] / 2
+                elif "HT" in clock or "HALF" in clock: mins = 20.0
                 else: mins = 5.0
                 
-                if mins > 2.0:
+                if mins > 1.5:
                     proj = (total / mins) * config['len'] * config['coeff']
                     
-                    # Fuzzy team match
+                    # Fuzzy match team name in odds
                     line = 0
-                    for team_key, team_line in odds_data.items():
-                        if team_key.upper() in game['home'].upper() or game['home'].upper() in team_key.upper():
-                            line = team_line
+                    for k, v in odds_data.items():
+                        if k.upper() in game['home'].upper() or game['home'].upper() in k.upper():
+                            line = v
                             break
                     
                     results.append({
@@ -123,7 +119,8 @@ with st.spinner(f"Scraping {config['apify_code']}..."):
             except: continue
 
 if results:
-    df = pd.DataFrame(results).sort_values(by="Savant Proj", ascending=False)
-    st.table(df)
+    st.table(pd.DataFrame(results).sort_values(by="Savant Proj", ascending=False))
 else:
-    st.info(f"No live {league_choice} games found.")
+    st.info("No live games matching your league were found. Note: Michigan State vs Wisconsin tips at 8:00 PM ET.")
+    with st.expander("🔍 Debug: See every live league found"):
+        st.write(list(set([g['league'] for g in live_games])))
