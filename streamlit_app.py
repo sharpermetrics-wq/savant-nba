@@ -5,8 +5,8 @@ import time
 import re
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant v38: Nuanced Comeback", layout="wide")
-st.title("🏀 Savant v38: The Nuanced Comeback")
+st.set_page_config(page_title="Savant v39: The Sniper", layout="wide")
+st.title("🏀 Savant v39: Game Day Edition")
 
 # --- MEMORY ---
 if 'sticky_lines' not in st.session_state:
@@ -14,31 +14,27 @@ if 'sticky_lines' not in st.session_state:
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("🏆 League")
+    st.header("🎯 Sniper Controls")
     league_choice = st.selectbox("League", ["College (NCAAB)", "NBA"])
     
-    # PARAMETERS
-    fav_threshold = st.slider("Heavy Favorite Threshold", -25.0, -1.0, -6.5, 0.5,
-        help="Spread must be this number or lower (e.g. -7) to trigger logic.")
+    # FOCUS MODE
+    focus_mode = st.toggle("Focus Mode (Edge > 3.0)", value=True, 
+        help="Only shows games with a significant betting edge.")
     
-    if st.button("🔄 REFRESH DATA", type="primary"):
+    # PARAMETERS
+    fav_threshold = st.slider("Heavy Fav Threshold", -25.0, -1.0, -6.5, 0.5)
+    
+    if st.button("🔄 SCAN MARKET", type="primary"):
         st.rerun()
     
     st.divider()
-    st.markdown("""
-    **🔥 Comeback Logic (v38):**
-    If Heavy Fav is losing in 2nd Half:
-    1. **Fav Boost:** +100% of Deficit (They chase)
-    2. **Dog Drag:** -50% of Deficit (They cool off)
-    3. **Net Effect:** Total + (Deficit * 0.5)
-    """)
+    st.caption("ℹ️ **Vol (Volatility):** High PPP (>1.3) means 'HOT' (expect cooling). Low PPP (<0.8) means 'COLD' (expect heating).")
 
 # --- HELPER: ODDS PARSER ---
 def parse_odds_data(comp):
     total = 0.0
     spread = 0.0
     fav = ""
-    
     if 'odds' in comp:
         for odd in comp['odds']:
             if total == 0.0 and 'overUnder' in odd:
@@ -46,13 +42,11 @@ def parse_odds_data(comp):
                     val = float(odd['overUnder'])
                     if val > 100: total = val
                 except: pass
-            
             if spread == 0.0 and 'details' in odd:
                 txt = odd['details'] 
                 match = re.search(r'([A-Z]+)\s+(-\d+\.?\d*)', txt)
                 if match:
-                    fav = match.group(1)
-                    spread = float(match.group(2))
+                    fav = match.group(1); spread = float(match.group(2))
     return total, spread, fav
 
 # --- STEP 1: FETCH GAMES ---
@@ -129,7 +123,7 @@ def fetch_deep_stats(game_id, league):
     except: return data
 
 # --- STEP 3: EXECUTION ---
-with st.spinner("Analyzing Momentum..."):
+with st.spinner("Scanning for Edges..."):
     live_games = fetch_game_data(league_choice)
 
 if not live_games:
@@ -143,7 +137,6 @@ else:
     for i, game in enumerate(live_games):
         progress.progress((i + 1) / len(live_games))
         
-        # Clock
         try:
             if ":" in game['clock_display']: m, s = map(int, game['clock_display'].split(':'))
             else: m, s = 0, 0
@@ -171,45 +164,46 @@ else:
             # --- MATH ---
             total_score = game['home_score'] + game['away_score']
             
-            # 1. Base Proj
+            # Base Proj
             base_proj = (total_score / mins) * FULL_TIME
             
-            # 2. Ref Bonus (Standard)
+            # Ref Bonus (Aggressive)
             fpm = deep['fouls'] / mins
             ref_adj = (fpm - 1.0) * 8.0 if fpm > 1.0 else 0 
             
-            # 3. COMEBACK ENGINE v38 (The Nuanced Mix)
+            # Comeback Logic (v38 Nuanced)
             comeback_adj = 0.0
             status = ""
-            
             is_second_half = (league_choice == "NBA" and p >= 3) or (league_choice != "NBA" and p >= 2)
             
             if is_second_half and game['spread'] <= fav_threshold:
-                # Calculate Deficit
-                fav_score = 0
-                dog_score = 0
+                fav_score = 0; dog_score = 0
                 if game['fav_team'] == game['home_abb']:
                     fav_score = game['home_score']; dog_score = game['away_score']
                 elif game['fav_team'] == game['away_abb']:
                     fav_score = game['away_score']; dog_score = game['home_score']
                 
                 deficit = dog_score - fav_score
-                
                 if deficit > 0:
-                    # THE FORMULA:
-                    # Fav Score Boost = +Deficit (They chase)
-                    # Dog Score Drag = -(Deficit * 0.5) (They tighten up/regress)
-                    # Net Total Impact = +0.5 * Deficit
                     comeback_adj = deficit * 0.5
                     status = f"⚠️ {game['fav_team']} Down {deficit}"
 
-            # 4. Final
+            # Volatility Flag (Efficiency Check)
+            # FGA - ORB + TOV + 0.44*FTA
+            raw_poss = deep['fga'] - deep['orb'] + deep['tov'] + (0.44 * deep['fta'])
+            if raw_poss < 1: raw_poss = 1
+            ppp = total_score / raw_poss
+            
+            vol_flag = "---"
+            if ppp > 1.30: vol_flag = "🔥 HOT"
+            elif ppp < 0.85: vol_flag = "❄️ COLD"
+
+            # Final Proj
             proj = base_proj + ref_adj + comeback_adj
             
-            # 5. Close Game Tax (Still applies if VERY close)
+            # Close Game Tax
             score_diff = abs(game['home_score'] - game['away_score'])
-            if is_second_half and score_diff <= 6: # Tightened to 6 pts
-                proj += 4.0 # Tightened to 4 pts
+            if is_second_half and score_diff <= 6: proj += 4.0
             
             edge = round(proj - final_line, 1) if final_line > 0 else -999.0
             p_str = f"Q{p}" if league_choice == "NBA" else (f"{p}H" if p <= 2 else f"OT{p-2}")
@@ -222,16 +216,22 @@ else:
                 "Line": final_line,
                 "Savant Proj": round(proj, 1),
                 "EDGE": edge,
-                "Spread": game['spread'],
-                "Alert": status
+                "Vol": vol_flag,
+                "Alert": status,
+                "SortEdge": abs(edge) if edge != -999 else 0
             })
 
     progress.empty()
 
     if results:
         df = pd.DataFrame(results)
-        df['sort_val'] = df['EDGE'].apply(lambda x: abs(x) if x != -999 else 0)
-        df = df.sort_values('sort_val', ascending=False).drop(columns=['sort_val'])
+        
+        # --- FOCUS MODE FILTER ---
+        if focus_mode:
+            # Filter for Edge > 3.0 OR Edge < -3.0
+            df = df[df['SortEdge'] >= 3.0]
+        
+        df = df.sort_values('SortEdge', ascending=False)
         
         st.data_editor(
             df,
@@ -239,14 +239,16 @@ else:
                 "Line": st.column_config.NumberColumn("Line (Edit)", required=True, format="%.1f"),
                 "EDGE": st.column_config.NumberColumn("Edge", format="%.1f"),
                 "Savant Proj": st.column_config.NumberColumn("Proj", format="%.1f"),
-                "Spread": st.column_config.NumberColumn("Spread", format="%.1f"),
-                "Alert": st.column_config.TextColumn("Situation"),
-                "ID": None
+                "Vol": st.column_config.TextColumn("Vol"),
+                "Alert": st.column_config.TextColumn("Alerts"),
+                "ID": None,
+                "SortEdge": None
             },
-            disabled=["Matchup", "Score", "Time", "Spread", "Alert", "Savant Proj", "EDGE"],
+            disabled=["Matchup", "Score", "Time", "Vol", "Alert", "Savant Proj", "EDGE"],
             use_container_width=True,
             hide_index=True
         )
         
+        # Save Edits
         for index, row in st.session_state.get('data_editor', {}).get('edited_rows', {}).items():
-            pass
+            pass # Handled by session state logic in loop
