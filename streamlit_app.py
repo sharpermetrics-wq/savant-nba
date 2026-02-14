@@ -3,21 +3,25 @@ import pandas as pd
 import requests
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant v15: Deep Search", layout="wide")
-st.title("🏀 Savant v15: Deep Stats Automation")
+st.set_page_config(page_title="Savant v16: Mid-Major Hunter", layout="wide")
+st.title("🏀 Savant v16: The 'Mid-Major' Hunter")
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("🏆 League")
     league_choice = st.selectbox("League", ["College (NCAAB)", "NBA"])
     
-    if st.button("🚀 REFRESH DATA", type="primary"):
+    if st.button("🚀 SCAN ALL DIV-I GAMES", type="primary"):
         st.rerun()
 
-# --- STEP 1: GET ACTIVE GAMES ---
+# --- STEP 1: GET ALL ACTIVE GAMES (UNFILTERED) ---
 def get_live_games(league):
-    sport_path = "basketball/nba" if league == "NBA" else "basketball/mens-college-basketball"
-    url = f"http://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard"
+    if league == "NBA":
+        # NBA doesn't need groups, just a high limit
+        url = "http://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?limit=100"
+    else:
+        # THE FIX: groups=50 unlocks ALL Division I games (not just Top 25)
+        url = "http://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard?groups=50&limit=1000"
     
     try:
         res = requests.get(url, timeout=10).json()
@@ -27,7 +31,7 @@ def get_live_games(league):
             comp = event['competitions'][0]
             status = event['status']['type']['state']
             
-            # Only process active games
+            # Only process active games ('in')
             if status == 'in':
                 # Get Odds (Try/Except to handle missing lines)
                 line = 0.0
@@ -48,7 +52,7 @@ def get_live_games(league):
         return games
     except: return []
 
-# --- STEP 2: GET BOX SCORE (The Fix) ---
+# --- STEP 2: GET BOX SCORE ---
 def get_box_stats(game_id, league):
     sport_path = "basketball/nba" if league == "NBA" else "basketball/mens-college-basketball"
     url = f"http://site.api.espn.com/apis/site/v2/sports/{sport_path}/summary?event={game_id}"
@@ -61,42 +65,39 @@ def get_box_stats(game_id, league):
         if 'boxscore' not in res or 'teams' not in res['boxscore']:
             return stats
             
-        # Iterate through both teams
         for team in res['boxscore']['teams']:
-            # The 'statistics' block is a list of objects. We must search by 'name' or 'label'.
             for stat in team.get('statistics', []):
                 name = stat.get('name', '').lower()
                 label = stat.get('label', '').lower()
                 val = 0.0
-                
                 try:
-                    # Clean up the display value (remove dashes, etc.)
                     raw_val = stat.get('displayValue', '0')
-                    
-                    # Case 1: Shooting Stats (e.g. "20-50") -> We want the attempts (50)
-                    if "-" in raw_val:
-                        val = float(raw_val.split('-')[1])
-                    else:
-                        val = float(raw_val)
+                    if "-" in raw_val: val = float(raw_val.split('-')[1]) # "20-50" -> 50
+                    else: val = float(raw_val)
                 except: val = 0.0
                 
-                # Match Keys
                 if "foul" in name or "pf" in label: stats['fouls'] += val
                 if "fieldgoals" in name or "fg" in label: stats['fga'] += val
                 if "freethrows" in name or "ft" in label: stats['fta'] += val
                 if "offensive" in name or "orb" in label: stats['orb'] += val
                 if "turnover" in name or "to" in label: stats['tov'] += val
-                
         return stats
-    except:
-        return stats
+    except: return stats
 
 # --- STEP 3: THE ENGINE ---
-with st.spinner("Analyzing Live Box Scores..."):
+# We use a progress bar because scanning 50+ mid-major games takes time
+with st.spinner("Initializing Deep Scan..."):
     active_games = get_live_games(league_choice)
-    results = []
+
+if not active_games:
+    st.info(f"No active {league_choice} games found.")
+else:
+    st.success(f"Found {len(active_games)} Active Games. Pulling Box Scores...")
     
-    # Config Constants
+    results = []
+    # Progress Bar for user sanity
+    progress_bar = st.progress(0)
+    
     if league_choice == "NBA":
         FULL_TIME = 48.0
         COEFF = 1.12
@@ -104,17 +105,18 @@ with st.spinner("Analyzing Live Box Scores..."):
         FULL_TIME = 40.0
         COEFF = 1.08
 
-    for game in active_games:
+    for i, game in enumerate(active_games):
+        # Update progress
+        progress_bar.progress((i + 1) / len(active_games))
+        
         # 1. Parse Clock
         try:
-            if ":" in game['clock']:
-                m, s = map(int, game['clock'].split(':'))
+            if ":" in game['clock']: m, s = map(int, game['clock'].split(':'))
             else: m, s = 0, 0
             
             p = game['period']
-            
-            # Mins Played Logic
             mins = 0.0
+            
             if league_choice == "NBA":
                 if p <= 4: mins = ((p-1)*12) + (12 - m - (s/60))
                 else: mins = 48.0 + ((p-4)*5) - m - (s/60)
@@ -130,26 +132,15 @@ with st.spinner("Analyzing Live Box Scores..."):
             
             # 3. Savant Math
             total_score = game['home_score'] + game['away_score']
-            
-            # Ref Factor (FPM)
             fpm = box['fouls'] / mins
-            
-            # True Possessions
-            # FGA - ORB + TOV + (0.44 * FTA)
             poss = box['fga'] - box['orb'] + box['tov'] + (0.44 * box['fta'])
-            
-            # Pace (Poss per minute)
             pace = poss / mins
-            
-            # Projection
             off_rtg = total_score / poss if poss > 0 else 0
             
-            # Ref Adjustment: If FPM > 1.2, add penalty boost
+            # Ref Adjustment
             ref_adj = (fpm - 1.2) * 10.0 if fpm > 1.2 else 0
-            
             proj = (pace * FULL_TIME * off_rtg) + ref_adj
             
-            # Edge
             line = game['line']
             edge = proj - line if line > 0 else 0
 
@@ -164,17 +155,18 @@ with st.spinner("Analyzing Live Box Scores..."):
                 "Line": line if line > 0 else "---",
                 "EDGE": round(edge, 1) if line > 0 else "N/A"
             })
+            
+    progress_bar.empty() # Clear bar when done
 
-# --- DISPLAY ---
-if results:
-    st.success(f"Tracking {len(results)} Live Games")
-    df = pd.DataFrame(results)
-    
-    # Sort by Edge Magnitude
-    if "EDGE" in df.columns and not df.empty:
-        df['sort'] = pd.to_numeric(df['EDGE'], errors='coerce').abs()
-        df = df.sort_values('sort', ascending=False).drop(columns=['sort'])
+    # --- DISPLAY ---
+    if results:
+        df = pd.DataFrame(results)
         
-    st.dataframe(df, use_container_width=True, hide_index=True)
-else:
-    st.info(f"No active {league_choice} games found.")
+        # Smart Sort: Put the biggest EDGE at the top
+        if "EDGE" in df.columns and not df.empty:
+            df['sort'] = pd.to_numeric(df['EDGE'], errors='coerce').abs()
+            df = df.sort_values('sort', ascending=False).drop(columns=['sort'])
+            
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.warning("Games found, but none have passed the 2-minute warm-up threshold.")
