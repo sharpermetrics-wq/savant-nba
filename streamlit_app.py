@@ -4,29 +4,28 @@ import requests
 import re
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant v18: Odds Hunter", layout="wide")
-st.title("🏀 Savant v18: The 'Odds Hunter'")
+st.set_page_config(page_title="Savant v19: Bloodhound", layout="wide")
+st.title("🏀 Savant v19: The Odds Bloodhound")
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("🏆 League")
     league_choice = st.selectbox("League", ["College (NCAAB)", "NBA"])
     
-    if st.button("🚀 FORCE REFRESH", type="primary"):
+    if st.button("🚀 FORCE DEEP SCAN", type="primary"):
         st.rerun()
-    
-    st.info("ℹ️ Tip: If a line shows '0.0', double-click the cell in the table to type it in manually.")
 
 # --- HELPER: TEXT PARSER ---
-def extract_ou_from_text(text):
-    # Looks for pattern "O/U 145.5" or "145.5 O/U"
+def parse_ou(text):
+    # Extracts "145.5" from "O/U 145.5" or "145.5"
     try:
-        match = re.search(r'O/U\s*(\d+\.?\d*)', text, re.IGNORECASE)
+        # Regex for number possibly followed by .5
+        match = re.search(r'(\d{3}\.?\d*)', str(text))
         if match: return float(match.group(1))
         return 0.0
     except: return 0.0
 
-# --- STEP 1: GET GAMES & ODDS (AGGRESSIVE) ---
+# --- STEP 1: GET ACTIVE GAMES ---
 def get_live_games(league):
     if league == "NBA":
         url = "http://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?limit=100"
@@ -39,49 +38,34 @@ def get_live_games(league):
     try:
         res = requests.get(url, timeout=10).json()
         games = []
-        
         for event in res.get('events', []):
-            comp = event['competitions'][0]
-            status = event['status']['type']['state']
-            
-            if status == 'in':
-                # --- THE FIX: AGGRESSIVE ODDS HUNTING ---
-                line = 0.0
-                
-                # Method A: dedicated 'overUnder' float
-                if 'odds' in comp:
-                    for odd in comp['odds']:
-                        if odd.get('overUnder'):
-                            line = float(odd['overUnder'])
-                            break
-                        # Method B: Parse 'details' string (e.g. "UK -5.0, O/U 155.5")
-                        if 'details' in odd:
-                            val = extract_ou_from_text(odd['details'])
-                            if val > 0: 
-                                line = val
-                                break
-
+            if event['status']['type']['state'] == 'in':
                 games.append({
                     "id": event['id'],
                     "matchup": event['name'],
                     "clock_raw": event['status']['displayClock'],
                     "period": event['status']['period'],
-                    "home_score": int(comp['competitors'][0]['score']),
-                    "away_score": int(comp['competitors'][1]['score']),
-                    "line": line, # Might be 0.0 if totally missing
+                    "home": int(event['competitions'][0]['competitors'][0]['score']),
+                    "away": int(event['competitions'][0]['competitors'][1]['score']),
                     "fd_link": fd_url
                 })
         return games
     except: return []
 
-# --- STEP 2: GET BOX SCORE ---
-def get_box_stats(game_id, league):
+# --- STEP 2: GET BOX SCORE & ODDS (THE BLOODHOUND) ---
+def get_game_data(game_id, league):
     sport_path = "basketball/nba" if league == "NBA" else "basketball/mens-college-basketball"
+    # usage of 'summary' endpoint which has BOTH Box Score AND PickCenter
     url = f"http://site.api.espn.com/apis/site/v2/sports/{sport_path}/summary?event={game_id}"
     
-    stats = {"fouls": 0, "fga": 0, "fta": 0, "orb": 0, "tov": 0}
+    data = {
+        "fouls": 0, "fga": 0, "fta": 0, "orb": 0, "tov": 0, "line": 0.0
+    }
+    
     try:
-        res = requests.get(url, timeout=5).json()
+        res = requests.get(url, timeout=6).json()
+        
+        # A. PARSE STATS (Standard)
         if 'boxscore' in res and 'teams' in res['boxscore']:
             for team in res['boxscore']['teams']:
                 for stat in team.get('statistics', []):
@@ -94,22 +78,41 @@ def get_box_stats(game_id, league):
                     lbl = stat.get('label', '').lower()
                     nm = stat.get('name', '').lower()
                     
-                    if "foul" in nm or "pf" in lbl: stats['fouls'] += val
-                    if "field" in nm or "fg" in lbl: stats['fga'] += val
-                    if "free" in nm or "ft" in lbl: stats['fta'] += val
-                    if "offensive" in nm or "orb" in lbl: stats['orb'] += val
-                    if "turnover" in nm or "to" in lbl: stats['tov'] += val
-        return stats
-    except: return stats
+                    if "foul" in nm or "pf" in lbl: data['fouls'] += val
+                    if "field" in nm or "fg" in lbl: data['fga'] += val
+                    if "free" in nm or "ft" in lbl: data['fta'] += val
+                    if "offensive" in nm or "orb" in lbl: data['orb'] += val
+                    if "turnover" in nm or "to" in lbl: data['tov'] += val
+
+        # B. PARSE ODDS (THE FIX)
+        # 1. Check 'pickcenter' (This is where multiple books live)
+        if 'pickcenter' in res:
+            for provider in res['pickcenter']:
+                # We check every provider until we find a number
+                if 'overUnder' in provider:
+                    try:
+                        val = float(provider['overUnder'])
+                        if val > 100: # Sanity check (must be a total, not a spread)
+                            data['line'] = val
+                            break
+                    except: continue
+        
+        # 2. Check 'odds' legacy block if PickCenter failed
+        if data['line'] == 0.0 and 'odds' in res:
+             try:
+                 data['line'] = float(res['odds'].get('overUnder', 0.0))
+             except: pass
+
+        return data
+    except: return data
 
 # --- STEP 3: THE ENGINE ---
-with st.spinner("Hunting Odds..."):
+with st.spinner("Hunting Lines & Deep Stats..."):
     active_games = get_live_games(league_choice)
 
 if not active_games:
     st.info(f"No active {league_choice} games found.")
 else:
-    # Progress Bar
     progress_bar = st.progress(0)
     results = []
     
@@ -136,25 +139,31 @@ else:
         except: mins = 0.0
 
         if mins > 2.0:
-            box = get_box_stats(game['id'], league_choice)
+            # FETCH DEEP DATA
+            game_data = get_game_data(game['id'], league_choice)
             
-            total = game['home_score'] + game['away_score']
-            fpm = box['fouls'] / mins
-            poss = box['fga'] - box['orb'] + box['tov'] + (0.44 * box['fta'])
+            total = game['home'] + game['away']
+            fpm = game_data['fouls'] / mins
+            poss = game_data['fga'] - game_data['orb'] + game_data['tov'] + (0.44 * game_data['fta'])
             pace = poss / mins
             off_rtg = total / poss if poss > 0 else 0
             
             ref_adj = (fpm - 1.2) * 10.0 if fpm > 1.2 else 0
             proj = (pace * FULL_TIME * off_rtg) + ref_adj
             
-            # We calculate edge later in the display loop to handle manual edits
+            line = game_data['line']
+            
+            # CALCULATE EDGE HERE SO IT SHOWS IN TABLE
+            edge = round(proj - line, 1) if line > 0 else -999.0
+
             results.append({
                 "Matchup": game['matchup'],
-                "Score": f"{game['away_score']}-{game['home_score']}",
+                "Score": f"{game['away']}-{game['home']}",
                 "Time": f"{round(mins,1)}",
                 "FPM": round(fpm, 2),
                 "Savant Proj": round(proj, 1),
-                "Line": game['line'], # KEEP AS FLOAT FOR EDITING
+                "Line": line,  # Keep as float for editing
+                "EDGE": edge,  # Sortable
                 "Link": game['fd_link']
             })
             
@@ -163,39 +172,24 @@ else:
     if results:
         df = pd.DataFrame(results)
         
-        st.markdown("### 📊 Live Board (Double-click 'Line' to edit)")
+        # Sort Logic: Absolute Edge Magnitude
+        df['sort_val'] = df['EDGE'].apply(lambda x: abs(x) if x != -999 else 0)
+        df = df.sort_values('sort_val', ascending=False).drop(columns=['sort_val'])
         
-        # --- EDITABLE TABLE ---
-        # This allows you to fix the "0.0" lines yourself
-        edited_df = st.data_editor(
+        # EDITABLE DISPLAY
+        # We use a column config to make "EDGE" look good but "Line" editable
+        st.data_editor(
             df,
             column_config={
                 "Link": st.column_config.LinkColumn("Bet", display_text="FanDuel 📲"),
-                "Line": st.column_config.NumberColumn("Line (Edit Me)", required=True),
-                "Savant Proj": st.column_config.NumberColumn("Proj", format="%.1f"),
-                "FPM": st.column_config.NumberColumn("Ref Factor", format="%.2f")
+                "Line": st.column_config.NumberColumn("Line (Edit)", required=True, format="%.1f"),
+                "EDGE": st.column_config.NumberColumn("Edge", format="%.1f"),
+                "Savant Proj": st.column_config.NumberColumn("Proj", format="%.1f")
             },
-            disabled=["Matchup", "Score", "Time", "FPM", "Savant Proj", "Link"],
+            disabled=["Matchup", "Score", "Time", "FPM", "Savant Proj", "EDGE", "Link"],
             use_container_width=True,
             hide_index=True
         )
         
-        # --- REAL-TIME EDGE CALCULATION ---
-        # We calculate the edge based on the *Edited* dataframe
-        if not edited_df.empty:
-            # Add EDGE column dynamically
-            edited_df['EDGE'] = edited_df.apply(
-                lambda row: round(row['Savant Proj'] - row['Line'], 1) if row['Line'] > 0 else 0.0, 
-                axis=1
-            )
-            
-            # Show the "Best Bets" below the table
-            best_bets = edited_df[edited_df['EDGE'].abs() > 4.0].sort_values(by='EDGE', key=abs, ascending=False)
-            
-            if not best_bets.empty:
-                st.divider()
-                st.subheader("🚨 SAVANT ALERTS")
-                for _, row in best_bets.iterrows():
-                    color = "green" if row['EDGE'] > 0 else "red"
-                    direction = "OVER" if row['EDGE'] > 0 else "UNDER"
-                    st.markdown(f":{color}[**{row['Matchup']}**]: Bet **{direction}** (Edge: {row['EDGE']})")
+        st.divider()
+        st.caption("ℹ️ 'Line' column is editable. If a line is missing (0.0), type it in to generate an instant Edge.")
