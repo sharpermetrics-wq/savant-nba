@@ -1,126 +1,177 @@
 import streamlit as st
 import pandas as pd
 import requests
+from apify_client import ApifyClient
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Savant v10: Stealth", layout="wide")
-st.title("🏀 Savant v10: The Stealth Engine")
+# --- SECURE CONFIG ---
+try:
+    APIFY_TOKEN = st.secrets["APIFY_TOKEN"]
+except:
+    st.error("Missing APIFY_TOKEN in Secrets!")
+    st.stop()
+
+# --- PAGE SETUP ---
+st.set_page_config(page_title="Savant v12: Ironclad", layout="wide")
+st.title("🏀 Savant v12: ESPN Integrated Engine")
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Math Settings")
-    mode = st.radio("Game Type", ["College (40m)", "NBA (48m)", "Intl (40m)"])
-    if "NBA" in mode:
-        FULL_TIME = 48.0
-        COEFF = 1.12
-    else:
-        FULL_TIME = 40.0
-        COEFF = 1.08 # Conservative for College/Intl
+    st.header("🏆 League Selection")
+    league_choice = st.selectbox("League", ["College (NCAAB)", "NBA", "WNBA"])
+    
+    # ESPN API Endpoint Mappings
+    league_map = {
+        "NBA": {
+            "url": "basketball/nba", 
+            "apify": "NBA", 
+            "len": 48, 
+            "coeff": 1.12
+        },
+        "College (NCAAB)": {
+            "url": "basketball/mens-college-basketball", 
+            "apify": "College-Basketball", 
+            "len": 40, 
+            "coeff": 1.08
+        },
+        "WNBA": {
+            "url": "basketball/wnba", 
+            "apify": "WNBA", 
+            "len": 40, 
+            "coeff": 1.05
+        }
+    }
+    config = league_map[league_choice]
 
-    if st.button("🚀 REFRESH FEED", type="primary"):
+    st.divider()
+    if st.button("🚀 SYNC LIVE FEED", type="primary"):
         st.rerun()
 
-# --- STEP 1: THE STEALTH REQUEST ---
-def get_live_games():
-    # 1. The URL
-    url = "https://prod-public-api.livescore.com/v1/api/react/live/basketball/0.00?MD=1"
-    
-    # 2. THE DISGUISE (Headers)
-    # This makes the server think we are a real user, not a bot.
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': 'https://www.livescore.com/',
-        'Origin': 'https://www.livescore.com',
-        'Accept-Language': 'en-US,en;q=0.9'
-    }
-    
+# --- STEP 1: ESPN DATA FETCH (THE FIX) ---
+def get_espn_data(sport_path):
+    # This is the open public API used by the ESPN App. It is extremely reliable.
+    base_url = f"http://site.api.espn.com/apis/site/v2/sports/{sport_path}/scoreboard"
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(base_url, timeout=10).json()
+        games = []
         
-        # Check if they blocked us (Status 403 or 429)
-        if response.status_code != 200:
-            st.error(f"Server Blocked Request (Status: {response.status_code})")
-            return None
+        for event in res.get('events', []):
+            comp = event['competitions'][0]
+            status = event['status']
             
-        return response.json()
-    except Exception as e:
-        st.error(f"Connection Error: {e}")
-        return None
-
-# --- STEP 2: THE PROCESSOR ---
-feed_data = get_live_games()
-found_games = []
-
-if feed_data and 'Stages' in feed_data:
-    for stage in feed_data['Stages']:
-        league = stage.get('Snm', 'Unknown')
-        for event in stage.get('Events', []):
-            found_games.append({
-                "League": league,
-                "Matchup": f"{event['T1'][0]['Nm']} vs {event['T2'][0]['Nm']}",
-                "Score": f"{event.get('Tr1',0)}-{event.get('Tr2',0)}",
-                "Total": int(event.get('Tr1',0) or 0) + int(event.get('Tr2',0) or 0),
-                "Clock": str(event.get('Eps', '00:00'))
+            # Extract Teams & Scores
+            home_team = next(c for c in comp['competitors'] if c['homeAway'] == 'home')
+            away_team = next(c for c in comp['competitors'] if c['homeAway'] == 'away')
+            
+            # Extract Clock
+            # ESPN sends clock as seconds remaining in period, or displayValue like "10:00"
+            clock_display = status.get('displayClock', '0:00')
+            period = status.get('period', 1)
+            state = status.get('type', {}).get('state', 'pre') # 'in', 'post', 'pre'
+            
+            games.append({
+                "matchup": event['name'],
+                "home": home_team['team']['displayName'],
+                "away": away_team['team']['displayName'],
+                "h_score": int(home_team.get('score', 0)),
+                "a_score": int(away_team.get('score', 0)),
+                "clock": clock_display,
+                "period": period,
+                "status": state
             })
+        return games
+    except Exception as e:
+        st.error(f"ESPN Feed Error: {e}")
+        return []
 
-# --- STEP 3: DISPLAY OR FALLBACK ---
-if found_games:
-    # 3A. AUTOMATED MODE
-    st.success(f"Tracking {len(found_games)} Live Games")
-    
-    # Simple Table
-    df = pd.DataFrame(found_games)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-else:
-    # 3B. MANUAL WAR ROOM (The Failsafe)
-    st.warning("⚠️ API Feed is blocked or empty. Switched to Manual Mode.")
-    st.info("Input the score from your TV to get the Savant Projection instantly.")
-    
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        score_now = st.number_input("Current Total Score", value=140, step=1)
-    with c2:
-        # Easy Time Input
-        time_str = st.text_input("Time Left (e.g. 10:00)", "10:00")
-        period = st.selectbox("Period", ["1st Half", "2nd Half", "Q1", "Q2", "Q3", "Q4"])
-    with c3:
-        live_line = st.number_input("Bookie Line", value=155.5)
-
-    # Manual Math Engine
-    mins_played = 0.0
+# --- STEP 2: ODDS FETCH (APIFY) ---
+def get_odds(league_code):
+    client = ApifyClient(APIFY_TOKEN)
     try:
-        m, s = map(int, time_str.split(':'))
-        
-        if "NBA" in mode: # Quarters
-            q_len = 12.0
-            q_map = {"Q1":1, "Q2":2, "Q3":3, "Q4":4}
-            curr_q = q_map.get(period, 1)
-            mins_played = ((curr_q - 1) * q_len) + (q_len - m - (s/60))
-        else: # College/Intl (Halves or Quarters)
-            if "Half" in period:
-                half_len = 20.0
-                if "1st" in period: mins_played = 20 - m - (s/60)
-                else: mins_played = 20 + (20 - m - (s/60))
-            else: # Quarters for NBB/Euro
-                q_len = 10.0
-                q_map = {"Q1":1, "Q2":2, "Q3":3, "Q4":4}
-                curr_q = q_map.get(period, 1)
-                mins_played = ((curr_q - 1) * q_len) + (q_len - m - (s/60))
+        run = client.actor("harvest/sportsbook-odds-scraper").call(run_input={"league": league_code, "sportsbook": "FanDuel"})
+        odds = {}
+        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+            home = item.get('homeTeam', '')
+            for odd in item.get('odds', []):
+                if odd.get('type') == 'overUnder':
+                    odds[home] = odd.get('overUnder', 0)
+        return odds
+    except: return {}
 
-    except: mins_played = 0.0
+# --- STEP 3: THE ENGINE ---
+with st.spinner(f"Connecting to ESPN {league_choice} Feed..."):
+    live_games = get_espn_data(config['url'])
+    
+    # Only fetch odds if games are actually live to save credits
+    active_games = [g for g in live_games if g['status'] == 'in']
+    odds_data = get_odds(config['apify']) if active_games else {}
+    
+    results = []
 
-    if mins_played > 1.0:
-        proj = (score_now / mins_played) * FULL_TIME * COEFF
-        edge = proj - live_line
+    for game in active_games:
+        total = game['h_score'] + game['a_score']
+        clock = game['clock']
+        period = game['period']
         
-        st.divider()
-        col_res1, col_res2 = st.columns(2)
-        with col_res1:
-            st.metric("SAVANT PROJECTION", f"{round(proj, 1)}")
-        with col_res2:
-            st.metric("EDGE", f"{round(edge, 1)}", delta_color="normal")
+        # --- ROBUST CLOCK PARSER (ESPN FORMAT) ---
+        try:
+            mins_played = 0.0
             
-        if edge > 4: st.success("🔥 STRONG OVER")
-        elif edge < -4: st.error("❄️ STRONG UNDER")
+            # 1. Parse "MM:SS" from ESPN
+            if ":" in clock:
+                m, s = map(int, clock.split(':'))
+            else:
+                m, s = 0, 0 # Handle weird states
+            
+            # 2. Logic for NCAA (2 Halves)
+            if league_choice == "College (NCAAB)":
+                if period == 1:
+                    mins_played = 20.0 - m - (s/60.0)
+                elif period == 2:
+                    mins_played = 20.0 + (20.0 - m - (s/60.0))
+                elif period >= 3: # Overtime
+                    mins_played = 40.0 + ((period-2) * 5.0) - m - (s/60.0)
+            
+            # 3. Logic for NBA (4 Quarters)
+            else:
+                q_len = 12.0
+                if period <= 4:
+                    mins_played = ((period - 1) * q_len) + (q_len - m - (s/60.0))
+                else: # Overtime
+                    mins_played = 48.0 + ((period-4) * 5.0) - m - (s/60.0)
+            
+            # 4. Halftime Check
+            if game['status'] == 'halftime':
+                mins_played = config['len'] / 2
+
+            # CALCULATION
+            if mins_played > 2.0:
+                proj = (total / mins_played) * config['len'] * config['coeff']
+                
+                # Fuzzy Match Odds
+                line = 0
+                for k, v in odds_data.items():
+                    # Check if "Ohio" is in "Ohio Bobcats"
+                    if k.upper() in game['home'].upper() or game['home'].upper() in k.upper():
+                        line = v
+                        break
+                
+                results.append({
+                    "Matchup": game['matchup'],
+                    "Score": f"{game['a_score']}-{game['h_score']}",
+                    "Clock": f"P{period} {clock}",
+                    "Savant Proj": round(proj, 1),
+                    "FanDuel Line": line if line > 0 else "---",
+                    "EDGE": round(proj - line, 1) if line > 0 else "N/A"
+                })
+        except: continue
+
+# --- DISPLAY ---
+if results:
+    st.success(f"Tracking {len(results)} Live Games")
+    st.table(pd.DataFrame(results).sort_values(by="Savant Proj", ascending=False))
+else:
+    st.info(f"No active {league_choice} games found. (ESPN Feed is Connected).")
+    # Debug: Show upcoming games so you know it's working
+    if live_games:
+        st.write("Upcoming / Finished Games on Feed:")
+        st.write([f"{g['matchup']} ({g['status']})" for g in live_games[:5]])
